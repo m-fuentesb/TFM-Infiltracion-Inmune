@@ -1,0 +1,4312 @@
+---
+title: "Caracterización del microambiente inmune utilizando datos transcriptómicos y estudio de su valor pronóstico en cáncer colorrectal"
+author: "María Fuentes Baile"
+date: "`r format(Sys.Date(),'%e de %B, %Y')`"
+header-includes:
+  \usepackage{fvextra}
+  \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+  pdf_document:
+    keep_tex: no
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Paquetes necesarios
+
+```{r}
+# Control de calidad
+library(Biobase)  # Funciones básicas de Bioconductor
+library(arrayQualityMetrics)  # Control de calidad de microarrays
+
+# Descripción de variables
+library(summarytools) # Tablas resumen y estadísticas descriptivas
+
+# Manipulación de datos
+library(reshape2) # Conversión de datos a formato largo
+
+# Análisis estadísticos
+library(car)  # Test de Levene
+library(FSA)  # Test de Dunn
+
+# Visualización y gráficas
+library(ggplot2)
+library(ggsignif) # Añadir significación a las gráficas
+library(ggpubr)   # Funciones para personalizar gráficos
+library(viridis)  # Paleta de colores
+
+# Métodos de deconvolución
+source('CIBERSORT.R')
+library(MCPcounter)
+library(ConsensusTME)
+library(quantiseqr)
+
+# Análisis de supervivencia
+library(survival)
+library(survminer) # Establecer punto de corte para supervivencia
+```
+
+# Conjuntos de datos
+
+## Preparación de los datos
+
+```{r}
+# Carga de los datos
+
+## Datos clínicos y de expresión del Dataset1
+load("./Datos1079.RData")
+
+## Dataset 2
+load("./exp.genes.RData") # Datos de expresión génica
+load("./datos_clinicos_clean.RData")  # Datos clínicos
+```
+
+Las variables clínicas del Dataset2 se han filtrado, seleccionando únicamente aquellas relevantes para el estudio.
+
+```{r}
+# Selección de variables clínicas en el Dataset2
+clinic2 <- data_clinic_clean[, c(1,3,4,8,14,15,16,24, 35, 41, 44, 45, 46)]
+```
+
+En el Dataset2, se ha creado la variable `Estadio_recod`, recodificando los valores de la variable `Estadio` a I, II y III. Posteriormente, se ha obtenido la información de los 5 valores faltantes en esta variable y han sido añadidos antes de proceder con el análisis. 
+
+```{r}
+# Valores incluidos en la variable Estadio
+table(clinic2$Estadio)
+
+# Recodificar la variable Estadio a Estadio_recod
+clinic2$Estadio_recod <- as.character(clinic2$Estadio)
+clinic2$Estadio_recod[clinic2$Estadio %in% c("IIA", "IIB", "IIC")] <- "II"
+clinic2$Estadio_recod[clinic2$Estadio == "IIIB"] <- "III"
+clinic2$Estadio_recod <- as.factor(clinic2$Estadio_recod)
+table(clinic2$Estadio_recod)
+
+# Comprobar valores NA en la variable Estadio_recod
+table(is.na(clinic2$Estadio_recod))
+# Identificar filas con valores NA
+which(is.na(clinic2$Estadio_recod))
+# Sustituir estos valores por los reales
+clinic2$Estadio_recod[c(29, 75, 216, 255, 256)] <- c("I", "II", "II", "II", "II")
+# Confirmar que ya no hay valores faltantes
+table(is.na(clinic2$Estadio_recod))
+```
+
+Para realizar los análisis de supervivencia, se han creado las variables `SurvTime` y `Status`. Además, se han corregido dos errores detectados en la variable `Fecha Diagnostico`.
+
+```{r}
+# Cambiar formato de las variables `Fecha de último seguimiento` y `Fecha Diagnostico` a fecha
+clinic2$`Fecha de último seguimiento`<- as.Date(clinic2$`Fecha de último seguimiento`)
+clinic2$`Fecha Diagnostico`<- as.Date(clinic2$`Fecha Diagnostico`)
+
+# Corregir errores de la variable `Fecha diagnostico`
+clinic2[50,4]
+clinic2[50,4]<-"2017-07-03"
+clinic2[219,4]
+clinic2[219,4]<-NA
+
+# Crear la variable SurvTime
+clinic2$SurvTime <- as.numeric(clinic2$`Fecha de último seguimiento` - clinic2$`Fecha Diagnostico`)
+
+# Crear la variable Status
+clinic2$Status <- ifelse(
+  clinic2$`Último seguimiento` %in% "Muerto con enfermedad", 1, 0)
+clinic2$Status<-as.factor(clinic2$Status)
+table(clinic2$Status)
+```
+
+## Análisis de calidad
+
+Para analizar la calidad de los datos se ha utilizado el paquete `arrayQualityMetrics`. En primer lugar, se ha convertido la matriz de expresión y los datos clínicos en un ExpressionSet.
+
+```{r eval=FALSE}
+# Dataset 1
+eset <- ExpressionSet(assayData = ex)
+pData(eset) <- clin
+arrayQualityMetrics(eset)
+
+# Dataset 2
+eset2 <- ExpressionSet(assayData = as.matrix(exp.genes))
+pData(eset2) <- clinic2
+arrayQualityMetrics(eset2)
+```
+
+Los informes generados por la función anterior revelan que hay 16 y 7 muestras identificadas como outliers mediante dos metodologías diferentes en los datasets 1 y 2, respectivamente. Para analizar si es necesario eliminarlas o no, se ha realizado un análisis de componentes principales (PCA) marcándolas de un color diferente. 
+
+```{r}
+# PCA Dataset1
+pca1 <- prcomp(t(ex), scale = TRUE)
+pca1_data <- data.frame(pca1$x, Patient = colnames(ex))
+# Lista de posibles outliers detectados por arrayQualityMetrics
+outliers1 <- c("GSM437150", "GSM437153", "GSM972097", "GSM972105", "GSM972264", "GSM972274", "GSM972275", "GSM972357", "GSM972444", "TCGA-A6-2679", "TCGA-AA-3542", "TCGA-AA-A004", "TCGA-AA-A01T", "TCGA-AZ-4681", "TCGA-D5-5540", "TCGA-F4-6703")
+# Crear la columna `Outlier` dentro de los resultados del pca
+pca1_data$Outlier <- ifelse(rownames(pca1_data) %in% outliers1, "Outlier", "Normal")
+
+# Representar el PCA marcando los outliers
+ggplot(pca1_data, aes(x = PC1, y = PC2, color = Outlier)) +
+  geom_point(size = 2) +
+   geom_text(data = subset(pca1_data, Outlier == "Outlier"), 
+            aes(label = Patient), 
+            hjust = 1, vjust = 1, size = 2, color = "black") +
+  scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+  xlim(-100, 225) + ylim(-150, 150) +
+  labs(title = "PCA Dataset1", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Hay tres muestras (TCGA-AA-A01T, TCGA-A6-2679 y TCGA-AA-A004) que se alejan claramente de la nube de datos principal, por lo que se han descartado del conjunto de datos. 
+
+```{r}
+# Listado de outliers definitivos
+outliers1 <- c("TCGA-A6-2679", "TCGA-AA-A004", "TCGA-AA-A01T")
+# Eliminar los outliers de los datos de expresión
+exp1 <- ex[, !colnames(ex) %in% outliers1]
+# Eliminar los outliers de los datos clínicos
+clinic1 <- clin[!clin$ID %in% outliers1, ]
+```
+
+```{r}
+# PCA Dataset2
+pca2 <- prcomp(t(exp.genes), scale = TRUE)
+pca2_data <- data.frame(pca2$x, Patient = colnames(exp.genes))
+# Lista de posibles outliers detectados por arrayQualityMetrics
+outliers2 <- c("UAT-2022-F-814", "UAT-2022-F-815", "UAT-2022-F-816", "UAT-2022-F-823", "UAT-2022-F-824", "UAT-2022-F-827", "UAT-2023-F-682")
+# Crear la columna `Outlier` dentro de los resultados del pca
+pca2_data$Outlier <- ifelse(rownames(pca2_data) %in% outliers2, "Outlier", "Normal")
+
+# Representar el PCA marcando los outliers
+ggplot(pca2_data, aes(x = PC1, y = PC2, color = Outlier)) +
+  geom_point(size = 2) +
+  geom_text(data = subset(pca2_data, Outlier == "Outlier"), 
+            aes(label = Patient), 
+            hjust = 1, vjust = 1, size = 2, color = "black") +
+  scale_color_manual(values = c("Normal" = "blue", "Outlier" = "red")) +
+  labs(title = "PCA Dataset2", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+En el Dataset2, los posibles valores atípicos se encuentran dentro del núcleo principal de los datos. Para verificar si su eliminación afecta significativamente la estructura general, se ha repetido el PCA tras eliminar estos valores. 
+
+```{r}
+# Crear un subconjunto sin los outliers
+expr2_filtered <- exp.genes[, !colnames(exp.genes) %in% outliers2]
+
+# Realizar el PCA en el subconjunto filtrado
+pca2_filtered <- prcomp(t(expr2_filtered), scale. = TRUE)
+
+# Convertir los resultados del PCA a un data frame para facilitar la visualización
+pca2_df <- as.data.frame(pca2_filtered$x)
+
+# Representar el PCA sin los outliers
+ggplot(pca2_df, aes(x = PC1, y = PC2)) +
+  geom_point(size = 2, color="blue") +
+  labs(title = "PCA Dataset2 sin outliers", x = "PC1", y = "PC2") +
+  theme_minimal()
+```
+
+Los resultados muestran que la estructura general de los datos permanece compacta y con una distribución similar, lo que indica que la exclusión de estos valores no altera significativamente el patrón de agrupamiento. Por tanto, estas muestras no se han descartado para los análisis posteriores. 
+
+## Análisis descriptivo
+
+Para realizar el análisis descriptivo de los conjuntos de datos, se ha utilizado la función `dfSummary` del paquete `summarytools`  para las variables clínicas y, de nuevo, el PCA para los datos de expresión. 
+
+```{r}
+# Resumen de las variables clínicas incluidas en el Dataset1
+d1_sum<- dfSummary(clinic1[2:9], style = "grid", plain.ascii = FALSE, varnumbers = FALSE, valid.col = FALSE)
+view(d1_sum)
+
+# Resumen de las variables clínicas incluidas en el Dataset2
+d2_sum<- dfSummary(clinic2[2:16], style = "grid", plain.ascii = FALSE, varnumbers = FALSE, valid.col = FALSE)
+view(d2_sum)
+```
+
+En este caso, el PCA se ha realizado para determinar si existe una separación clara entre los pacientes de estadio II y III. 
+
+```{r}
+# PCA del Dataset1 separando los estadios
+pca1 <- prcomp(t(exp1), scale = TRUE)
+pca_data1 <- as.data.frame(pca1$x)
+pca_data1$Estadio <- clinic1$stage[match(rownames(pca_data1), clinic1$ID)]
+
+
+ggplot(pca_data1, aes(x = PC1, y = PC2, color = Estadio)) +
+  geom_point(size = 2) +
+  labs(title = "PCA Dataset1 por estadio", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  scale_color_manual(values = c("II" = "blue", "III" = "red"))
+```
+
+En el Dataset2, la representación del PCA se ha realizado en función de los estadios, las recidivas y el lote.
+
+```{r}
+# PCA del Dataset2 en función del estadio
+pca2_data$Estadio <- clinic2$Estadio[match(rownames(pca2_data), clinic2$`CÓDIGO IDENTIFICACIÓN`)]
+
+ggplot(pca2_data, aes(x = PC1, y = PC2, color = Estadio)) +
+  geom_point(size = 2) +
+  labs(title = "PCA Dataset2 por estadio", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+
+# PCA del Dataset2 en función de las recidivas
+pca2_data$Recidiva <- clinic2$Recidiva[match(rownames(pca2_data), clinic2$`CÓDIGO IDENTIFICACIÓN`)]
+
+ggplot(pca2_data, aes(x = PC1, y = PC2, color = Recidiva)) +
+  geom_point(size = 2) +
+  labs(title = "PCA Dataset2 en función de las recidivas", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  scale_color_manual(values = c("No" = "blue", "Si" = "red"))
+
+# PCA del Dataset2 separando por lote
+pca2_data$Lote <- clinic2$batch[match(rownames(pca2_data), clinic2$`CÓDIGO IDENTIFICACIÓN`)]
+ggplot(pca2_data, aes(x = PC1, y = PC2, color = Lote)) +
+  geom_point(size = 2) +
+  labs(title = "PCA Dataset2 por lote", x = "PC1", y = "PC2") +
+  theme_minimal() 
+```
+
+# Caracterización del microambiente inmune
+
+## CIBERSORT
+
+```{r}
+# Almacenar los datos de expresión de ambos datasets en archivos de texto tabulados
+write.table(exp1, file = "./exp1.txt", sep = "\t", quote = FALSE, row.names = TRUE)
+write.table(exp.genes, file = "./exp_genes.txt", sep = "\t", quote = FALSE, row.names = TRUE)
+
+# Deconvolución
+cibersort_r1<-CIBERSORT(sig_matrix = "./LM22.txt", mixture_file = "./exp1.txt", perm = 100, QN=TRUE)
+cibersort_r1 <- t(cibersort_r1)
+cibersort_r2<-CIBERSORT(sig_matrix = "./LM22.txt", mixture_file = "./exp_genes.txt", perm = 100, QN=TRUE)
+cibersort_r2 <- t(cibersort_r2)
+
+# Representación Dataset1
+## Preparar el dataframe
+cibersort_r1 <- as.data.frame(cibersort_r1)
+cibersort_r1_rep <- cibersort_r1[-c(23, 24, 25), ]
+cibersort_r1_rep$cell_type <- rownames(cibersort_r1_rep) 
+
+## Convertir de formato ancho a largo
+cibersort1_long <- melt(cibersort_r1_rep, id.vars="cell_type", variable.name = "sample", value.name = "fraction")
+
+## Visualizar con ggplot2
+ggplot(cibersort1_long, aes(x = sample, y = fraction, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  labs(x = "Muestras", y = "Fracción Celular", fill = "Tipo de Célula", title = "Dataset 1") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm")  
+  ) +
+  guides(fill = guide_legend(ncol = 1)) 
+
+# Representación Dataset 2
+## Preparar el dataframe
+cibersort_r2 <- as.data.frame(cibersort_r2)
+cibersort_r2_rep <- cibersort_r2[-c(23, 24, 25), ]
+cibersort_r2_rep$cell_type <- rownames(cibersort_r2_rep) 
+
+## Convertir de formato ancho a largo
+cibersort2_long <- melt(cibersort_r2_rep, id.vars="cell_type", variable.name = "sample", value.name = "fraction")
+
+## Visualizar con ggplot2
+ggplot(cibersort2_long, aes(x = sample, y = fraction, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  labs(x = "Muestras", y = "Fracción Celular", fill = "Tipo de Célula", title = "Dataset 2") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm")  
+  ) +
+  guides(fill = guide_legend(ncol = 1)) 
+```
+
+## MCP Counter
+
+```{r} 
+# Deconvolución
+MCP_r1 <- MCPcounter.estimate(exp1, featuresType = "HUGO_symbols", probesets=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/probesets.txt"),sep="\t",stringsAsFactors=FALSE,colClasses="character"), genes=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/genes.txt"),sep="\t",stringsAsFactors=FALSE,header=TRUE,colClasses="character",check.names=FALSE))
+
+MCP_r2 <- MCPcounter.estimate(exp.genes, featuresType = "HUGO_symbols", probesets=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/probesets.txt"),sep="\t",stringsAsFactors=FALSE,colClasses="character"), genes=read.table(curl("http://raw.githubusercontent.com/ebecht/MCPcounter/master/Signatures/genes.txt"),sep="\t",stringsAsFactors=FALSE,header=TRUE,colClasses="character",check.names=FALSE))
+
+# Representación Dataset1
+## Preparar el dataframe
+MCP_r1 <- as.data.frame(MCP_r1)
+MCP_r1$cell_type <- rownames(MCP_r1)
+
+## Convertir a formato largo
+MCP1_long <- melt(MCP_r1, id.vars = "cell_type", variable.name = "sample", value.name = "score")
+
+## Visualizar con ggplot2
+ggplot(MCP1_long, aes(x = sample, y = score, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) + 
+  theme_minimal() +
+  labs(x = "Muestras", y = "Score", fill = "Tipo de Célula", title = "Dataset 1") +
+  theme(axis.text.x = element_blank()) 
+
+# Representación Dataset 2
+## Preparar el dataframe
+MCP_r2 <- as.data.frame(MCP_r2)
+MCP_r2$cell_type <- rownames(MCP_r2) 
+
+## Convertir a formato largo
+MCP2_long <- melt(MCP_r2, id.vars = "cell_type", variable.name = "sample", value.name = "score")
+
+# Visualizar con ggplot2
+ggplot(MCP2_long, aes(x = sample, y = score, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) + 
+  theme_minimal() +
+  labs(x = "Muestras", y = "Score", fill = "Tipo de Célula", title = "Dataset 2") +
+  theme(axis.text.x = element_blank())
+```
+
+## Quantiseq
+
+```{r}
+# Deconvolución
+quantiseq_r1 <- quantiseqr::run_quantiseq(exp1, signature_matrix = "TIL10", is_arraydata = TRUE, is_tumordata = TRUE)
+quantiseq_r1 <- quantiseq_r1[,-1]   # Descartar la columna "Sample"
+quantiseq_r1 <- t(quantiseq_r1)   # Transponer
+
+quantiseq_r2 <- quantiseqr::run_quantiseq(exp.genes, signature_matrix = "TIL10", is_arraydata = TRUE, is_tumordata = TRUE)
+quantiseq_r2 <- quantiseq_r2[,-1]   # Descartar la columna "Sample"
+quantiseq_r2 <- t(quantiseq_r2)   # Transponer
+
+# Representación Dataset1 
+## Preparar el dataframe 
+quantiseq_r1 <- as.data.frame(quantiseq_r1)
+quantiseq_r1$cell_type <- rownames(quantiseq_r1) 
+
+## Convertir a formato largo
+quantiseq1_long <- melt(quantiseq_r1, id.vars = "cell_type", variable.name = "sample", value.name = "fraction")
+
+## Visualizar con ggplot2
+ggplot(quantiseq1_long, aes(x = sample, y = fraction, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  labs(x = "Muestras", y = "Fracción Celular", fill = "Tipo de Célula", title = "Dataset 1") +
+  theme(axis.text.x = element_blank(), 
+        legend.position = "right", 
+        legend.box = "vertical", 
+        legend.text = element_text(size = 6), 
+        legend.title = element_blank())   
+
+# Representación Dataset 2
+## Preparar el dataframe
+quantiseq_r2 <- as.data.frame(quantiseq_r2)
+quantiseq_r2$cell_type <- rownames(quantiseq_r2) 
+
+## Convertir a formato largo
+quantiseq2_long <- melt(quantiseq_r2, id.vars = "cell_type", variable.name = "sample", value.name = "fraction")
+
+## Visualizar con ggplot2
+ggplot(quantiseq2_long, aes(x = sample, y = fraction, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+     scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  labs(x = "Muestras", y = "Fracción Celular", fill = "Tipo de Célula", title = "Dataset 2") +
+  theme(axis.text.x = element_blank(), 
+        legend.position = "right", 
+        legend.box = "vertical", 
+        legend.text = element_text(size = 6), 
+        legend.title = element_blank())   
+```
+
+## Consensus TME
+
+```{r}
+# Deconvolución
+TME_r1<-ConsensusTME::consensusTMEAnalysis(as.matrix(exp1), cancer = "COAD", statMethod = "gsva")
+TME_r2<-ConsensusTME::consensusTMEAnalysis(as.matrix(exp.genes), cancer = "COAD", statMethod = "gsva")
+
+# Representación Dataset 1
+## Preparar el dataframe 
+TME_r1 <- as.data.frame(TME_r1)
+TME_r1_rep <- TME_r1[-19, ]   # Descartar la columna Immune_score
+TME_r1_rep$cell_type <- rownames(TME_r1_rep) 
+
+## Convertir a formato largo
+TME1_long <- melt(TME_r1_rep, id.vars = "cell_type", variable.name = "sample", value.name = "score")
+
+# Visualizar con ggplot2
+ggplot(TME1_long, aes(x = sample, y = score, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  labs(x = "Muestras", y = "Score", fill = "Tipo de Célula", title = "Dataset 1") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm")  
+  ) +
+  guides(fill = guide_legend(ncol = 1)) 
+
+# Representación Dataset 2
+## Preparar el dataframe 
+TME_r2 <- as.data.frame(TME_r2)
+TME_r2_rep <- TME_r2[-19, ]   # Descartar la columna Immune_score
+TME_r2_rep$cell_type <- rownames(TME_r2_rep) 
+
+## Convertir a formato largo
+TME2_long <- melt(TME_r2_rep, id.vars = "cell_type", variable.name = "sample", value.name = "score")
+
+# Visualizar con ggplot2
+ggplot(TME2_long, aes(x = sample, y = score, fill = cell_type)) +
+  geom_bar(stat = "identity") + 
+    scale_fill_viridis(discrete = TRUE) +  
+  theme_minimal() +
+  labs(x = "Muestras", y = "Score", fill = "Tipo de Célula", title = "Dataset 2") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm")  
+  ) +
+  guides(fill = guide_legend(ncol = 1)) 
+```
+
+# Diferencias en la infiltración del sistema inmune entre los estadios II y III
+
+```{r}
+# Crear el dataframe Estadios
+Estadios <- clinic1[, c("ID", "stage")]    
+colnames(Estadios) <- c("ID", "Estadio")
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber_data1 <- as.data.frame(t(cibersort_r1_rep))   # Transponer los datos
+inf_ciber_data1[] <- lapply(inf_ciber_data1, function(x) as.numeric(as.character(x)))   # Asegurar que todos los datos sean numéricos
+inf_ciber_data1$ID <- rownames(inf_ciber_data1)   # Asignar los nombres de fila como la columna 'ID'
+inf_ciber_data1 <- merge(inf_ciber_data1, Estadios, by = "ID")    # Fusionar los datos de infiltración con los estadios  
+inf_ciber_data1$Estadio <- as.factor(inf_ciber_data1$Estadio)   # Convertir la columna 'Estadio' en un factor
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_data1)[2:23]   # Definir los tipos celulares  
+
+result_ciber1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)    # Crear un dataframe vacío para almacenar los resultados
+
+for (tipo in tipos_celulares) {
+  grupo_II <- inf_ciber_data1[inf_ciber_data1$Estadio == "II", tipo]    # Filtrar los datos para el estadio II
+  grupo_III <- inf_ciber_data1[inf_ciber_data1$Estadio == "III", tipo]    # Filtrar los datos para el estadio III
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times = c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber1[result_ciber1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_ciber1$significacion <- cut(
+  result_ciber1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_data1, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber1$significacion[match(unique(infiltration_long$Cell_Type), result_ciber1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 0.6) +
+  # Añadir significación
+   geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+
+# MCP-counter
+## Preparar los datos
+inf_MCP_data1 <- as.data.frame(t(MCP_r1))   # Transponer los datos
+inf_MCP_data1[] <- lapply(inf_MCP_data1, function(x) as.numeric(as.character(x)))   # Asegurar que todos los datos sean numéricos
+inf_MCP_data1$ID <- rownames(inf_MCP_data1)   # Asignar los nombres de fila como la columna 'ID'
+inf_MCP_data1 <- merge(inf_MCP_data1, Estadios, by = "ID")    # Fusionar los datos de infiltración con los estadios  
+inf_MCP_data1$Estadio <- as.factor(inf_MCP_data1$Estadio)   # Convertir la columna 'Estadio' en un factor
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_data1)[2:11]   # Definir los tipos celulares  
+
+result_MCP1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)    # Crear un dataframe vacío para almacenar los resultados
+
+for (tipo in tipos_celulares) {
+  grupo_II <- inf_MCP_data1[inf_MCP_data1$Estadio == "II", tipo]    # Filtrar los datos para el estadio II
+  grupo_III <- inf_MCP_data1[inf_MCP_data1$Estadio == "III", tipo]    # Filtrar los datos para el estadio III
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times = c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP1[result_MCP1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_MCP1$significacion <- cut(
+  result_MCP1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_data1, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP1$significacion[match(unique(infiltration_long$Cell_Type), result_MCP1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 13) +
+  # Añadir significación
+   geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+
+# quanTIseq
+## Preparar los datos
+inf_quant_data1 <- as.data.frame(t(quantiseq_r1))   # Transponer los datos
+inf_quant_data1[] <- lapply(inf_quant_data1, function(x) as.numeric(as.character(x)))   # Asegurar que todos los datos sean numéricos
+inf_quant_data1$ID <- rownames(inf_quant_data1)   # Asignar los nombres de fila como la columna 'ID'
+inf_quant_data1 <- merge(inf_quant_data1, Estadios, by = "ID")    # Fusionar los datos de infiltración con los estadios  
+inf_quant_data1$Estadio <- as.factor(inf_quant_data1$Estadio)   # Convertir la columna 'Estadio' en un factor
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_data1)[2:12]   # Definir los tipos celulares  
+
+result_quant1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)    # Crear un dataframe vacío para almacenar los resultados
+
+for (tipo in tipos_celulares) {
+  grupo_II <- inf_quant_data1[inf_quant_data1$Estadio == "II", tipo]    # Filtrar los datos para el estadio II
+  grupo_III <- inf_quant_data1[inf_quant_data1$Estadio == "III", tipo]    # Filtrar los datos para el estadio III
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times = c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant1[result_quant1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_quant1$significacion <- cut(
+  result_quant1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_data1, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant1$significacion[match(unique(infiltration_long$Cell_Type), result_quant1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # Añadir significación
+   geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+
+# ConsensusTME
+## Preparar los datos
+inf_TME_data1 <- as.data.frame(t(TME_r1_rep))   # Transponer los datos
+inf_TME_data1[] <- lapply(inf_TME_data1, function(x) as.numeric(as.character(x)))   # Asegurar que todos los datos sean numéricos
+inf_TME_data1$ID <- rownames(inf_TME_data1)   # Asignar los nombres de fila como la columna 'ID'
+inf_TME_data1 <- merge(inf_TME_data1, Estadios, by = "ID")    # Fusionar los datos de infiltración con los estadios  
+inf_TME_data1$Estadio <- as.factor(inf_TME_data1$Estadio)   # Convertir la columna 'Estadio' en un factor
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_data1)[2:19]   # Definir los tipos celulares  
+
+result_TME1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)    # Crear un dataframe vacío para almacenar los resultados
+
+for (tipo in tipos_celulares) {
+  grupo_II <- inf_TME_data1[inf_TME_data1$Estadio == "II", tipo]    # Filtrar los datos para el estadio II
+  grupo_III <- inf_TME_data1[inf_TME_data1$Estadio == "III", tipo]    # Filtrar los datos para el estadio III
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times = c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME1[result_TME1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_TME1$significacion <- cut(
+  result_TME1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_data1, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME1$significacion[match(unique(infiltration_long$Cell_Type), result_TME1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # Añadir significación
+   geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+```
+
+# Diferencias en la infiltración del sistema inmune entre los estadios IIA, IIB y IIC
+
+```{r}
+# Preparar el dataframe Estadio
+Estadio <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "Estadio")]
+colnames(Estadio) <- c("ID", "Estadio")    
+Estadio <- Estadio[Estadio$Estadio %in% c("IIA", "IIB", "IIC"), ]    
+
+# CIBERSORT
+## Preparar los datos
+cibersort_filtered <- cibersort_r2_rep[, colnames(cibersort_r2_rep) %in% Estadio$ID]    # Seleccionar los valores de infiltración de los ID presentes en `Estadio`
+inf_ciber_estadio <- as.data.frame(t(cibersort_filtered))
+inf_ciber_estadio$ID <- rownames(inf_ciber_estadio)  
+inf_ciber_estadio <- merge(inf_ciber_estadio, Estadio, by = "ID")
+inf_ciber_estadio$Estadio <- as.factor(inf_ciber_estadio$Estadio)
+inf_ciber_estadio <- inf_ciber_estadio[ , -c(8,10,12)]    # Descartar tipos celulares cuyos valores son idénticos
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_estadio)[2:20]
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, Test = NA, p_value = NA, Comparaciones = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_IIA <- inf_ciber_estadio[inf_ciber_estadio$Estadio == "IIA", tipo]
+  grupo_IIB <- inf_ciber_estadio[inf_ciber_estadio$Estadio == "IIB", tipo]
+  grupo_IIC <- inf_ciber_estadio[inf_ciber_estadio$Estadio == "IIC", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  normalidad <- all(
+    shapiro.test(grupo_IIA)$p.value > 0.05,
+    shapiro.test(grupo_IIB)$p.value > 0.05,
+    shapiro.test(grupo_IIC)$p.value > 0.05
+    )
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_IIA, grupo_IIB, grupo_IIC), grupo = rep(c("IIA", "IIB", "IIC"), times = c(length(grupo_IIA), length(grupo_IIB), length(grupo_IIC))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+     # Si hay normalidad y homocedasticidad, usar ANOVA
+    if (normalidad && hom_var) {
+      test_result <- aov(get(tipo) ~ Estadio, data = inf_ciber_estadio)
+      p_valor <- summary(test_result)[[1]][["Pr(>F)"]][1]
+      result_ciber2[result_ciber2$TipoCelular == tipo, "Test"]<- "ANOVA"
+      result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado del ANOVA es significativo aplicar el Test HSD de Tukey
+      if(p_valor < 0.05) {
+        comparaciones <- TukeyHSD(test_result)$Estadio
+        comp_sig <- rownames(comparaciones)[comparaciones[, "p adj"] < 0.05]
+        result_ciber2[result_ciber2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+    } else {
+      # Si no hay normalidad y homocedasticidad, usar Kruskal Wallis
+      test_result <- kruskal.test(get(tipo) ~ Estadio, data = inf_ciber_estadio)
+      p_valor <- test_result$p.value
+      result_ciber2[result_ciber2$TipoCelular == tipo, "Test"]<- "Kruskal-Wallis"
+      result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado de Kruskal Wallis es significativo aplicar el test de Dunn ajustado con el método de bonferroni
+      if(p_valor < 0.05) {
+        comparaciones <- dunnTest(get(tipo) ~ Estadio, data = inf_ciber_estadio, method = "bonferroni")
+        comp_sig <- comparaciones$res$Comparison[comparaciones$res$P.unadj < 0.05]
+        result_ciber2[result_ciber2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+    }}
+
+### Imprimir resultado
+print(result_ciber2)
+    
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_estadio, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # Añadir significación manualmente
+  geom_signif(y_position = c(0.35, 0.48), xmin = c(1.7, 15.7), xmax = c(2.3, 16), annotation = c("*", "*"),
+              tip_length = 0.01)
+
+# MCP-counter
+## Preparar los datos
+MCP_filtered <- MCP_r2[, colnames(MCP_r2) %in% Estadio$ID]    # Seleccionar los valores de infiltración de los ID presentes en `Estadio`
+inf_MCP_estadio <- as.data.frame(t(MCP_filtered))
+inf_MCP_estadio$ID <- rownames(inf_MCP_estadio)  
+inf_MCP_estadio <- merge(inf_MCP_estadio, Estadio, by = "ID")
+inf_MCP_estadio$Estadio <- as.factor(inf_MCP_estadio$Estadio)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_estadio)[2:11]
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, Test = NA, p_value = NA, Comparaciones = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_IIA <- inf_MCP_estadio[inf_MCP_estadio$Estadio == "IIA", tipo]
+  grupo_IIB <- inf_MCP_estadio[inf_MCP_estadio$Estadio == "IIB", tipo]
+  grupo_IIC <- inf_MCP_estadio[inf_MCP_estadio$Estadio == "IIC", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  normalidad <- all(
+    shapiro.test(grupo_IIA)$p.value > 0.05,
+    shapiro.test(grupo_IIB)$p.value > 0.05,
+    shapiro.test(grupo_IIC)$p.value > 0.05
+    )
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_IIA, grupo_IIB, grupo_IIC), grupo = rep(c("IIA", "IIB", "IIC"), times = c(length(grupo_IIA), length(grupo_IIB), length(grupo_IIC))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+     # Si hay normalidad y homocedasticidad, usar ANOVA
+    if (normalidad && hom_var) {
+      test_result <- aov(get(tipo) ~ Estadio, data = inf_MCP_estadio)
+      p_valor <- summary(test_result)[[1]][["Pr(>F)"]][1]
+      result_MCP2[result_MCP2$TipoCelular == tipo, "Test"]<- "ANOVA"
+      result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado del ANOVA es significativo aplicar el Test HSD de Tukey
+      if(p_valor < 0.05) {
+        comparaciones <- TukeyHSD(test_result)$Estadio
+        comp_sig <- rownames(comparaciones)[comparaciones[, "p adj"] < 0.05]
+        result_MCP2[result_MCP2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+    } else {
+      # Si no hay normalidad y homocedasticidad, usar Kruskal Wallis
+      test_result <- kruskal.test(get(tipo) ~ Estadio, data = inf_MCP_estadio)
+      p_valor <- test_result$p.value
+      result_MCP2[result_MCP2$TipoCelular == tipo, "Test"]<- "Kruskal-Wallis"
+      result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado de Kruskal Wallis es significativo aplicar el test de Dunn ajustado con el método de bonferroni
+      if(p_valor < 0.05) {
+        comparaciones <- dunnTest(get(tipo) ~ Estadio, data = inf_MCP_estadio, method = "bonferroni")
+        comp_sig <- comparaciones$res$Comparison[comparaciones$res$P.unadj < 0.05]
+        result_MCP2[result_MCP2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+}}
+
+### Imprimir resultado
+print(result_MCP2)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_estadio, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # Añadir significación manualmente
+  geom_signif(y_position = 7.5, xmin = 7.7, xmax = 8, annotation = c("*"),
+              tip_length = 0.01)
+
+# quanTIseq
+## Preparar los datos
+quant_filtered <- quantiseq_r2[, colnames(quantiseq_r2) %in% Estadio$ID]    # Seleccionar los valores de infiltración de los ID presentes en `Estadio`
+inf_quant_estadio <- as.data.frame(t(quant_filtered))
+inf_quant_estadio$ID <- rownames(inf_quant_estadio)  
+inf_quant_estadio <- merge(inf_quant_estadio, Estadio, by = "ID")
+inf_quant_estadio$Estadio <- as.factor(inf_quant_estadio$Estadio)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_estadio)[2:12]
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, Test = NA, p_value = NA, Comparaciones = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_IIA <- inf_quant_estadio[inf_quant_estadio$Estadio == "IIA", tipo]
+  grupo_IIB <- inf_quant_estadio[inf_quant_estadio$Estadio == "IIB", tipo]
+  grupo_IIC <- inf_quant_estadio[inf_quant_estadio$Estadio == "IIC", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  normalidad <- all(
+    shapiro.test(grupo_IIA)$p.value > 0.05,
+    shapiro.test(grupo_IIB)$p.value > 0.05,
+    shapiro.test(grupo_IIC)$p.value > 0.05
+    )
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_IIA, grupo_IIB, grupo_IIC), grupo = rep(c("IIA", "IIB", "IIC"), times = c(length(grupo_IIA), length(grupo_IIB), length(grupo_IIC))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+     # Si hay normalidad y homocedasticidad, usar ANOVA
+    if (normalidad && hom_var) {
+      test_result <- aov(get(tipo) ~ Estadio, data = inf_quant_estadio)
+      p_valor <- summary(test_result)[[1]][["Pr(>F)"]][1]
+      result_MCP2[result_MCP2$TipoCelular == tipo, "Test"]<- "ANOVA"
+      result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado del ANOVA es significativo aplicar el Test HSD de Tukey
+      if(p_valor < 0.05) {
+        comparaciones <- TukeyHSD(test_result)$Estadio
+        comp_sig <- rownames(comparaciones)[comparaciones[, "p adj"] < 0.05]
+        result_quant2[result_quant2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+    } else {
+      # Si no hay normalidad y homocedasticidad, usar Kruskal Wallis
+      test_result <- kruskal.test(get(tipo) ~ Estadio, data = inf_quant_estadio)
+      p_valor <- test_result$p.value
+      result_quant2[result_quant2$TipoCelular == tipo, "Test"]<- "Kruskal-Wallis"
+      result_quant2[result_quant2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado de Kruskal Wallis es significativo aplicar el test de Dunn ajustado con el método de bonferroni
+      if(p_valor < 0.05) {
+        comparaciones <- dunnTest(get(tipo) ~ Estadio, data = inf_quant_estadio, method = "bonferroni")
+        comp_sig <- comparaciones$res$Comparison[comparaciones$res$P.unadj < 0.05]
+        result_quant2[result_quant2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+}}
+
+### Imprimir resultado
+print(result_quant2)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_estadio, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "QuanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+# ConsensusTME
+## Preparar los datos
+TME_filtered <- TME_r2_rep[, colnames(TME_r2_rep) %in% Estadio$ID]    # Seleccionar los valores de infiltración de los ID presentes en `Estadio`
+inf_TME_estadio <- as.data.frame(t(TME_filtered))
+inf_TME_estadio$ID <- rownames(inf_TME_estadio)  
+inf_TME_estadio <- merge(inf_TME_estadio, Estadio, by = "ID")
+inf_TME_estadio$Estadio <- as.factor(inf_TME_estadio$Estadio)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_estadio)[2:19]
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, Test = NA, p_value = NA, Comparaciones = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_IIA <- inf_TME_estadio[inf_TME_estadio$Estadio == "IIA", tipo]
+  grupo_IIB <- inf_TME_estadio[inf_TME_estadio$Estadio == "IIB", tipo]
+  grupo_IIC <- inf_TME_estadio[inf_TME_estadio$Estadio == "IIC", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  normalidad <- all(
+    shapiro.test(grupo_IIA)$p.value > 0.05,
+    shapiro.test(grupo_IIB)$p.value > 0.05,
+    shapiro.test(grupo_IIC)$p.value > 0.05
+    )
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_IIA, grupo_IIB, grupo_IIC), grupo = rep(c("IIA", "IIB", "IIC"), times = c(length(grupo_IIA), length(grupo_IIB), length(grupo_IIC))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+     # Si hay normalidad y homocedasticidad, usar ANOVA
+    if (normalidad && hom_var) {
+      test_result <- aov(get(tipo) ~ Estadio, data = inf_TME_estadio)
+      p_valor <- summary(test_result)[[1]][["Pr(>F)"]][1]
+      result_TME2[result_TME2$TipoCelular == tipo, "Test"]<- "ANOVA"
+      result_TME2[result_TME2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado del ANOVA es significativo aplicar el Test HSD de Tukey
+      if(p_valor < 0.05) {
+        comparaciones <- TukeyHSD(test_result)$Estadio
+        comp_sig <- rownames(comparaciones)[comparaciones[, "p adj"] < 0.05]
+        result_TME2[result_TME2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+    } else {
+      # Si no hay normalidad y homocedasticidad, usar Kruskal Wallis
+      test_result <- kruskal.test(get(tipo) ~ Estadio, data = inf_TME_estadio)
+      p_valor <- test_result$p.value
+      result_TME2[result_TME2$TipoCelular == tipo, "Test"]<- "Kruskal-Wallis"
+      result_TME2[result_TME2$TipoCelular == tipo, "p_value"]<- p_valor
+      # Si el resultado de Kruskal Wallis es significativo aplicar el test de Dunn ajustado con el método de bonferroni
+      if(p_valor < 0.05) {
+        comparaciones <- dunnTest(get(tipo) ~ Estadio, data = inf_TME_estadio, method = "bonferroni")
+        comp_sig <- comparaciones$res$Comparison[comparaciones$res$P.unadj < 0.05]
+        result_TME2[result_TME2$TipoCelular == tipo, "Comparaciones"] <- paste(comp_sig, collapse = "; ")
+      }
+}}
+
+### Imprimir resultado
+print(result_TME2)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_estadio, id.vars = c("ID", "Estadio"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Estadio)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  # Añadir significación manualmente
+  geom_signif(y_position = 0.6, xmin = 7.7, xmax = 8, annotation = c("**"),
+              tip_length = 0.01)
+```
+
+# Diferencias en la infiltración del sistema inmune en pacientes en estadio II que han sufrido o no recidivas. 
+
+```{r}
+# Preparar el dataframe Recidiva
+Recidiva <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "Estadio_recod", "Recidiva")]
+colnames(Recidiva) <- c("ID", "Estadio", "Recidiva")    
+Recidiva <- Recidiva[Recidiva$Estadio %in% "II", ]    # Seleccionar pacientes en estadio II
+Recidiva <- Recidiva[ ,-2]    # Eliminar columna Estadio
+Recidiva <- Recidiva[Recidiva$Recidiva %in% c("No", "Si"), ]    # Descartar NA
+
+# CIBERSORT
+## Preparar los datos
+cibersort_filtered <- cibersort_r2_rep[, colnames(cibersort_r2_rep) %in% Recidiva$ID]
+inf_ciber_recid <- as.data.frame(t(cibersort_filtered))
+inf_ciber_recid$ID <- rownames(inf_ciber_recid)  
+inf_ciber_recid <- merge(inf_ciber_recid, Recidiva, by = "ID")
+inf_ciber_recid$Recidiva <- as.factor(inf_ciber_recid$Recidiva)
+inf_ciber_recid <- inf_ciber_recid[ , -c(8,10,12)]    # Descartar tipos celulares cuyos valores son idénticos
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_recid)[2:20]
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_ciber_recid[inf_ciber_recid$Recidiva == "Si", tipo]
+  grupo_No <- inf_ciber_recid[inf_ciber_recid$Recidiva == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_ciber2$significacion <- cut(
+  result_ciber2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_recid, id.vars = c("ID", "Recidiva"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber2$significacion[match(unique(infiltration_long$Cell_Type), result_ciber2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Recidiva)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+
+# MCP-counter
+## Preparar los datos
+MCP_filtered <- MCP_r2[, colnames(MCP_r2) %in% Recidiva$ID]
+inf_MCP_recid <- as.data.frame(t(MCP_filtered))
+inf_MCP_recid$ID <- rownames(inf_MCP_recid)  
+inf_MCP_recid <- merge(inf_MCP_recid, Recidiva, by = "ID")
+inf_MCP_recid$Recidiva <- as.factor(inf_MCP_recid$Recidiva)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_recid)[2:11]
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_MCP_recid[inf_MCP_recid$Recidiva == "Si", tipo]
+  grupo_No <- inf_MCP_recid[inf_MCP_recid$Recidiva == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_MCP2$significacion <- cut(
+  result_MCP2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_recid, id.vars = c("ID", "Recidiva"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP2$significacion[match(unique(infiltration_long$Cell_Type), result_MCP2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Recidiva)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+
+# quanTIseq
+## Preparar los datos
+quant_filtered <- quantiseq_r2[, colnames(quantiseq_r2) %in% Recidiva$ID]
+inf_quant_recid <- as.data.frame(t(quant_filtered))
+inf_quant_recid$ID <- rownames(inf_quant_recid)  
+inf_quant_recid <- merge(inf_quant_recid, Recidiva, by = "ID")
+inf_quant_recid$Recidiva <- as.factor(inf_quant_recid$Recidiva)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_recid)[2:12]
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_quant_recid[inf_quant_recid$Recidiva == "Si", tipo]
+  grupo_No <- inf_quant_recid[inf_quant_recid$Recidiva == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_quant2$significacion <- cut(
+  result_quant2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_recid, id.vars = c("ID", "Recidiva"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant2$significacion[match(unique(infiltration_long$Cell_Type), result_quant2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Recidiva)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+
+# ConsensusTME
+## Preparar los datos
+TME_filtered <- TME_r2_rep[, colnames(TME_r2_rep) %in% Recidiva$ID]
+inf_TME_recid <- as.data.frame(t(TME_filtered))
+inf_TME_recid$ID <- rownames(inf_TME_recid)  
+inf_TME_recid <- merge(inf_TME_recid, Recidiva, by = "ID")
+inf_TME_recid$Recidiva <- as.factor(inf_TME_recid$Recidiva)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_recid)[2:19]
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_TME_recid[inf_TME_recid$Recidiva == "Si", tipo]
+  grupo_No <- inf_TME_recid[inf_TME_recid$Recidiva == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_TME2$significacion <- cut(
+  result_TME2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_recid, id.vars = c("ID", "Recidiva"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME2$significacion[match(unique(infiltration_long$Cell_Type), result_TME2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Recidiva)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0)
+```
+
+# Relación entre los perfiles inmunes y las variables clínicas
+
+## Género
+
+```{r}
+# Preparar el dataframe Sexo
+Sexo <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "GENERO")]
+colnames(Sexo) <- c("ID", "Género")
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber_sexo <- as.data.frame(t(cibersort_r2_rep))
+inf_ciber_sexo[] <- lapply(inf_ciber_sexo, function(x) as.numeric(as.character(x)))   
+inf_ciber_sexo$ID <- rownames(inf_ciber_sexo)  
+inf_ciber_sexo <- merge(inf_ciber_sexo, Sexo, by = "ID")
+inf_ciber_sexo$Género <- as.factor(inf_ciber_sexo$Género)
+inf_ciber_sexo <- inf_ciber_sexo[ , -8]   # Descartar tipos celulares cuyos valores son idénticos.
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_sexo)[2:22]  
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Mujer <- inf_ciber_sexo[inf_ciber_sexo$Género == "Mujer", tipo]
+  grupo_Hombre <- inf_ciber_sexo[inf_ciber_sexo$Género == "Hombre", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Mujer)$p.value > 0.05 && shapiro.test(grupo_Hombre)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Mujer, grupo_Hombre), grupo = rep(c("Mujer", "Hombre"), times = c(length(grupo_Mujer), length(grupo_Hombre))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Mujer, grupo_Hombre)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_ciber2$significacion <- cut(
+  result_ciber2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_sexo, id.vars = c("ID", "Género"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber2$significacion[match(unique(infiltration_long$Cell_Type), result_ciber2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Género)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 0.7) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# MCP-counter
+## Preparar los datos
+inf_MCP_sexo <- as.data.frame(t(MCP_r2))
+inf_MCP_sexo[] <- lapply(inf_MCP_sexo, function(x) as.numeric(as.character(x)))   
+inf_MCP_sexo$ID <- rownames(inf_MCP_sexo)  
+inf_MCP_sexo <- merge(inf_MCP_sexo, Sexo, by = "ID")
+inf_MCP_sexo$Género <- as.factor(inf_MCP_sexo$Género)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_sexo)[2:11]  
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Mujer <- inf_MCP_sexo[inf_MCP_sexo$Género == "Mujer", tipo]
+  grupo_Hombre <- inf_MCP_sexo[inf_MCP_sexo$Género == "Hombre", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Mujer)$p.value > 0.05 && shapiro.test(grupo_Hombre)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Mujer, grupo_Hombre), grupo = rep(c("Mujer", "Hombre"), times = c(length(grupo_Mujer), length(grupo_Hombre))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Mujer, grupo_Hombre)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_MCP2$significacion <- cut(
+  result_MCP2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_sexo, id.vars = c("ID", "Género"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP2$significacion[match(unique(infiltration_long$Cell_Type), result_MCP2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Género)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# quanTIseq
+## Preparar los datos
+inf_quant_sexo <- as.data.frame(t(quantiseq_r2))
+inf_quant_sexo[] <- lapply(inf_quant_sexo, function(x) as.numeric(as.character(x)))   
+inf_quant_sexo$ID <- rownames(inf_quant_sexo)  
+inf_quant_sexo <- merge(inf_quant_sexo, Sexo, by = "ID")
+inf_quant_sexo$Género <- as.factor(inf_quant_sexo$Género)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_sexo)[2:12]  
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Mujer <- inf_quant_sexo[inf_quant_sexo$Género == "Mujer", tipo]
+  grupo_Hombre <- inf_quant_sexo[inf_quant_sexo$Género == "Hombre", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Mujer)$p.value > 0.05 && shapiro.test(grupo_Hombre)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Mujer, grupo_Hombre), grupo = rep(c("Mujer", "Hombre"), times = c(length(grupo_Mujer), length(grupo_Hombre))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Mujer, grupo_Hombre)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_quant2$significacion <- cut(
+  result_quant2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_sexo, id.vars = c("ID", "Género"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant2$significacion[match(unique(infiltration_long$Cell_Type), result_quant2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Género)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# ConsensusTME
+## Preparar los datos
+inf_TME_sexo <- as.data.frame(t(TME_r2_rep))
+inf_TME_sexo[] <- lapply(inf_TME_sexo, function(x) as.numeric(as.character(x)))   
+inf_TME_sexo$ID <- rownames(inf_TME_sexo)  
+inf_TME_sexo <- merge(inf_TME_sexo, Sexo, by = "ID")
+inf_TME_sexo$Género <- as.factor(inf_TME_sexo$Género)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_sexo)[2:19]  
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Mujer <- inf_TME_sexo[inf_TME_sexo$Género == "Mujer", tipo]
+  grupo_Hombre <- inf_TME_sexo[inf_TME_sexo$Género == "Hombre", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Mujer)$p.value > 0.05 && shapiro.test(grupo_Hombre)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Mujer, grupo_Hombre), grupo = rep(c("Mujer", "Hombre"), times = c(length(grupo_Mujer), length(grupo_Hombre))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Mujer, grupo_Hombre, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Mujer, grupo_Hombre)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_TME2$significacion <- cut(
+  result_TME2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_sexo, id.vars = c("ID", "Género"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME2$significacion[match(unique(infiltration_long$Cell_Type), result_TME2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Género)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+```
+
+## Edad
+
+```{r}
+# Preparar el dataframe Edad
+Edad <- data_clinic_clean[, c("CÓDIGO IDENTIFICACIÓN", "EDAD")]
+colnames(Edad) <- c("ID", "Edad")
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber_edad <- as.data.frame(t(cibersort_r2_rep))
+inf_ciber_edad[] <- lapply(inf_ciber_edad, function(x) as.numeric(as.character(x)))   
+inf_ciber_edad$ID <- rownames(inf_ciber_edad)  
+inf_ciber_edad <- merge(inf_ciber_edad, Edad, by = "ID")
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_edad)[2:23]  
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(inf_ciber_edad[[tipo]])$p.value > 0.05 && shapiro.test(inf_ciber_edad$Edad)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos <- data.frame(valor = c(inf_ciber_edad[[tipo]], inf_ciber_edad$Edad), grupo = rep(c("Tipo", "Edad"), times = c(length(inf_ciber_edad[[tipo]]), length(inf_ciber_edad$Edad))))
+    hom_var <- leveneTest(valor~grupo, data = datos)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar el test de correlación según la distribución y la homogeneidad de varianzas
+    if (hom_var) {
+      # Si hay normalidad y homocedasticidad, usar Pearson
+      test_result <- cor.test(inf_ciber_edad[[tipo]], inf_ciber_edad$Edad, method = "pearson")
+    } else {
+      # Si no hay homocedasticidad, usar Spearman
+      test_result <- cor.test(inf_ciber_edad[[tipo]], inf_ciber_edad$Edad, method = "spearman")
+    }
+  } else {
+    # Si no hay normalidad, usar Spearman
+    test_result <- cor.test(inf_ciber_edad[[tipo]], inf_ciber_edad$Edad, method = "spearman")
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Añadir etiquetas cuando el p-valor sea inferior a 0.05
+result_ciber2$etiqueta <- ifelse(
+  result_ciber2$p_value < 0.05,
+  paste0("p = ", signif(result_ciber2$p_value, 2)), "")
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_edad, id.vars = c("ID", "Edad"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Unir etiquetas con datos largos
+infiltration_long <- merge(
+  infiltration_long, 
+  result_ciber2, 
+  by.x = "Cell_Type", 
+  by.y = "TipoCelular", 
+  all.x = TRUE
+)
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Edad, y = Infiltration, color = Cell_Type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+  facet_wrap(~Cell_Type, scales = "free_y") +
+  labs(title = "CIBERSORT",
+       x = "Edad",
+       y = "Infiltración") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm"),
+    strip.text = element_text(size = 6)  
+  ) +
+  guides(color = guide_legend(ncol = 1)) +
+  geom_text(
+    aes(x = Inf, y = Inf, label = etiqueta),
+    inherit.aes = FALSE,
+    hjust = 3,
+    vjust = 14,
+    size = 2
+  )
+
+# MCP-counter
+## Preparar los datos
+inf_MCP_edad <- as.data.frame(t(MCP_r2))
+inf_MCP_edad[] <- lapply(inf_MCP_edad, function(x) as.numeric(as.character(x)))   
+inf_MCP_edad$ID <- rownames(inf_MCP_edad)  
+inf_MCP_edad <- merge(inf_MCP_edad, Edad, by = "ID")
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_edad)[2:11]  
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(inf_MCP_edad[[tipo]])$p.value > 0.05 && shapiro.test(inf_MCP_edad$Edad)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos <- data.frame(valor = c(inf_MCP_edad[[tipo]], inf_MCP_edad$Edad), grupo = rep(c("Tipo", "Edad"), times = c(length(inf_MCP_edad[[tipo]]), length(inf_MCP_edad$Edad))))
+    hom_var <- leveneTest(valor~grupo, data = datos)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar el test de correlación según la distribución y la homogeneidad de varianzas
+    if (hom_var) {
+      # Si hay normalidad y homocedasticidad, usar Pearson
+      test_result <- cor.test(inf_MCP_edad[[tipo]], inf_MCP_edad$Edad, method = "pearson")
+    } else {
+      # Si no hay homocedasticidad, usar Spearman
+      test_result <- cor.test(inf_MCP_edad[[tipo]], inf_MCP_edad$Edad, method = "spearman")
+    }
+  } else {
+    # Si no hay normalidad, usar Spearman
+    test_result <- cor.test(inf_MCP_edad[[tipo]], inf_MCP_edad$Edad, method = "spearman")
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Añadir etiquetas cuando el p-valor sea inferior a 0.05
+result_MCP2$etiqueta <- ifelse(
+  result_MCP2$p_value < 0.05,
+  paste0("p = ", signif(result_MCP2$p_value, 2)), "")
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_edad, id.vars = c("ID", "Edad"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Unir etiquetas con datos largos
+infiltration_long <- merge(
+  infiltration_long, 
+  result_MCP2, 
+  by.x = "Cell_Type", 
+  by.y = "TipoCelular", 
+  all.x = TRUE
+)
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Edad, y = Infiltration, color = Cell_Type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+  facet_wrap(~Cell_Type, scales = "free_y") +
+  labs(title = "MCP counter",
+       x = "Edad",
+       y = "Infiltración") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm"),
+    strip.text = element_text(size = 6)  
+  ) +
+  geom_text(
+    aes(x = Inf, y = Inf, label = etiqueta),
+    inherit.aes = FALSE,
+    hjust = 3,
+    vjust = 14,
+    size = 2
+  )
+
+# quanTIseq
+## Preparar los datos
+inf_quant_edad <- as.data.frame(t(quantiseq_r2))
+inf_quant_edad[] <- lapply(inf_quant_edad, function(x) as.numeric(as.character(x)))   
+inf_quant_edad$ID <- rownames(inf_quant_edad)  
+inf_quant_edad <- merge(inf_quant_edad, Edad, by = "ID")
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_edad)[2:12]  
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(inf_quant_edad[[tipo]])$p.value > 0.05 && shapiro.test(inf_quant_edad$Edad)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos <- data.frame(valor = c(inf_quant_edad[[tipo]], inf_quant_edad$Edad), grupo = rep(c("Tipo", "Edad"), times = c(length(inf_quant_edad[[tipo]]), length(inf_quant_edad$Edad))))
+    hom_var <- leveneTest(valor~grupo, data = datos)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar el test de correlación según la distribución y la homogeneidad de varianzas
+    if (hom_var) {
+      # Si hay normalidad y homocedasticidad, usar Pearson
+      test_result <- cor.test(inf_quant_edad[[tipo]], inf_quant_edad$Edad, method = "pearson")
+    } else {
+      # Si no hay homocedasticidad, usar Spearman
+      test_result <- cor.test(inf_quant_edad[[tipo]], inf_quant_edad$Edad, method = "spearman")
+    }
+  } else {
+    # Si no hay normalidad, usar Spearman
+    test_result <- cor.test(inf_quant_edad[[tipo]], inf_quant_edad$Edad, method = "spearman")
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Añadir etiquetas cuando el p-valor sea inferior a 0.05
+result_quant2$etiqueta <- ifelse(
+  result_quant2$p_value < 0.05,
+  paste0("p = ", signif(result_quant2$p_value, 2)), "")
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_edad, id.vars = c("ID", "Edad"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Unir etiquetas con datos largos
+infiltration_long <- merge(
+  infiltration_long, 
+  result_quant2, 
+  by.x = "Cell_Type", 
+  by.y = "TipoCelular", 
+  all.x = TRUE
+)
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Edad, y = Infiltration, color = Cell_Type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+  facet_wrap(~Cell_Type, scales = "free_y") +
+  labs(title = "quanTIseq",
+       x = "Edad",
+       y = "Infiltración") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm"),
+    strip.text = element_text(size = 6)  
+  ) +
+  geom_text(
+    aes(x = Inf, y = Inf, label = etiqueta),
+    inherit.aes = FALSE,
+    hjust = 3,
+    vjust = 14,
+    size = 2
+  )
+
+# ConsensusTME
+## Preparar los datos
+inf_TME_edad <- as.data.frame(t(TME_r2_rep))
+inf_TME_edad[] <- lapply(inf_TME_edad, function(x) as.numeric(as.character(x)))   
+inf_TME_edad$ID <- rownames(inf_TME_edad)  
+inf_TME_edad <- merge(inf_TME_edad, Edad, by = "ID")
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_edad)[2:19]  
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(inf_TME_edad[[tipo]])$p.value > 0.05 && shapiro.test(inf_TME_edad$Edad)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos <- data.frame(valor = c(inf_TME_edad[[tipo]], inf_TME_edad$Edad), grupo = rep(c("Tipo", "Edad"), times = c(length(inf_TME_edad[[tipo]]), length(inf_TME_edad$Edad))))
+    hom_var <- leveneTest(valor~grupo, data = datos)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar el test de correlación según la distribución y la homogeneidad de varianzas
+    if (hom_var) {
+      # Si hay normalidad y homocedasticidad, usar Pearson
+      test_result <- cor.test(inf_TME_edad[[tipo]], inf_TME_edad$Edad, method = "pearson")
+    } else {
+      # Si no hay homocedasticidad, usar Spearman
+      test_result <- cor.test(inf_TME_edad[[tipo]], inf_TME_edad$Edad, method = "spearman")
+    }
+  } else {
+    # Si no hay normalidad, usar Spearman
+    test_result <- cor.test(inf_TME_edad[[tipo]], inf_TME_edad$Edad, method = "spearman")
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Añadir etiquetas cuando el p-valor sea inferior a 0.05
+result_TME2$etiqueta <- ifelse(
+  result_TME2$p_value < 0.05,
+  paste0("p = ", signif(result_TME2$p_value, 2)), "")
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_edad, id.vars = c("ID", "Edad"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Unir etiquetas con datos largos
+infiltration_long <- merge(
+  infiltration_long, 
+  result_TME2, 
+  by.x = "Cell_Type", 
+  by.y = "TipoCelular", 
+  all.x = TRUE
+)
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Edad, y = Infiltration, color = Cell_Type)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+  facet_wrap(~Cell_Type, scales = "free_y") +
+  labs(title = "ConsensusTME",
+       x = "Edad",
+       y = "Infiltración") +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "right",  
+    legend.box = "vertical",
+    legend.direction = "vertical",  
+    legend.text = element_text(size = 6),
+    legend.title = element_blank(),
+    legend.key.size = unit(0.3, "cm"),
+    strip.text = element_text(size = 6)  
+  ) +
+  geom_text(
+    aes(x = Inf, y = Inf, label = etiqueta),
+    inherit.aes = FALSE,
+    hjust = 2.2,
+    vjust = 10,
+    size = 2
+  )
+```
+
+## Grado
+
+```{r}
+# Preparar el dataframe Grado
+Grado <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "Grado")]
+colnames(Grado) <- c("ID", "Grado")
+Grado <- Grado[Grado$Grado %in% c("Alto", "Bajo"), ] # Descartar los pacientes con tumores no gradables
+
+# CIBERSORT
+## Preparar los datos
+cibersort_filtered <- cibersort_r2_rep[, colnames(cibersort_r2_rep) %in% Grado$ID]
+inf_ciber_grado <- as.data.frame(t(cibersort_filtered))
+inf_ciber_grado$ID <- rownames(inf_ciber_grado)  
+inf_ciber_grado <- merge(inf_ciber_grado, Grado, by = "ID")
+inf_ciber_grado$Grado <- as.factor(inf_ciber_grado$Grado)
+inf_ciber_grado <- inf_ciber_grado[ , -8]   # Descartar tipos celulares cuyos valores son idénticos.
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_grado)[2:22]  
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Alto <- inf_ciber_grado[inf_ciber_grado$Grado == "Alto", tipo]
+  grupo_Bajo <- inf_ciber_grado[inf_ciber_grado$Grado == "Bajo", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Alto)$p.value > 0.05 && shapiro.test(grupo_Bajo)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Alto, grupo_Bajo), grupo = rep(c("Alto", "Bajo"), times = c(length(grupo_Alto), length(grupo_Bajo))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Alto, grupo_Bajo)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_ciber2$significacion <- cut(
+  result_ciber2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_grado, id.vars = c("ID", "Grado"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber2$significacion[match(unique(infiltration_long$Cell_Type), result_ciber2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grado)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 0.7) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# MCP-counter
+## Preparar los datos
+MCP_filtered <- MCP_r2[, colnames(MCP_r2) %in% Grado$ID]
+inf_MCP_grado <- as.data.frame(t(MCP_filtered))
+inf_MCP_grado$ID <- rownames(inf_MCP_grado)  
+inf_MCP_grado <- merge(inf_MCP_grado, Grado, by = "ID")
+inf_MCP_grado$Grado <- as.factor(inf_MCP_grado$Grado)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_grado)[2:11]  
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Alto <- inf_MCP_grado[inf_MCP_grado$Grado == "Alto", tipo]
+  grupo_Bajo <- inf_MCP_grado[inf_MCP_grado$Grado == "Bajo", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Alto)$p.value > 0.05 && shapiro.test(grupo_Bajo)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Alto, grupo_Bajo), grupo = rep(c("Alto", "Bajo"), times = c(length(grupo_Alto), length(grupo_Bajo))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Alto, grupo_Bajo)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_MCP2$significacion <- cut(
+  result_MCP2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_grado, id.vars = c("ID", "Grado"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP2$significacion[match(unique(infiltration_long$Cell_Type), result_MCP2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grado)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# quanTIseq
+## Preparar los datos
+quant_filtered <- quantiseq_r2[, colnames(quantiseq_r2) %in% Grado$ID]
+inf_quant_grado <- as.data.frame(t(quant_filtered))
+inf_quant_grado$ID <- rownames(inf_quant_grado)  
+inf_quant_grado <- merge(inf_quant_grado, Grado, by = "ID")
+inf_quant_grado$Grado <- as.factor(inf_quant_grado$Grado)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_grado)[2:12]  
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Alto <- inf_quant_grado[inf_quant_grado$Grado == "Alto", tipo]
+  grupo_Bajo <- inf_quant_grado[inf_quant_grado$Grado == "Bajo", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Alto)$p.value > 0.05 && shapiro.test(grupo_Bajo)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Alto, grupo_Bajo), grupo = rep(c("Alto", "Bajo"), times = c(length(grupo_Alto), length(grupo_Bajo))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Alto, grupo_Bajo)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_quant2$significacion <- cut(
+  result_quant2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_grado, id.vars = c("ID", "Grado"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant2$significacion[match(unique(infiltration_long$Cell_Type), result_quant2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grado)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# ConsensusTME
+## Preparar los datos
+TME_filtered <- TME_r2_rep[, colnames(TME_r2_rep) %in% Grado$ID]
+inf_TME_grado <- as.data.frame(t(TME_filtered))
+inf_TME_grado$ID <- rownames(inf_TME_grado)  
+inf_TME_grado <- merge(inf_TME_grado, Grado, by = "ID")
+inf_TME_grado$Grado <- as.factor(inf_TME_grado$Grado)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_grado)[2:19]  
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Alto <- inf_TME_grado[inf_TME_grado$Grado == "Alto", tipo]
+  grupo_Bajo <- inf_TME_grado[inf_TME_grado$Grado == "Bajo", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Alto)$p.value > 0.05 && shapiro.test(grupo_Bajo)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Alto, grupo_Bajo), grupo = rep(c("Alto", "Bajo"), times = c(length(grupo_Alto), length(grupo_Bajo))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Alto, grupo_Bajo, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Alto, grupo_Bajo)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_TME2$significacion <- cut(
+  result_TME2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_grado, id.vars = c("ID", "Grado"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME2$significacion[match(unique(infiltration_long$Cell_Type), result_TME2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grado)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+```
+
+## Invasión linfática
+
+```{r}
+# Preparar el dataframe Inv_linfatica
+Inv_linfatica <- data_clinic_clean[, c("CÓDIGO IDENTIFICACIÓN", "Invasión Linfatica")]
+colnames(Inv_linfatica) <- c("ID", "Invasión Linfática") 
+Inv_linfatica <- Inv_linfatica[Inv_linfatica$`Invasión Linfática` %in% c("Si", "No"), ] # Descartar los datos NA
+
+# CIBERSORT
+## Preparar los datos
+cibersort_filtered <- cibersort_r2_rep[, colnames(cibersort_r2_rep) %in% Inv_linfatica$ID]
+inf_ciber_il <- as.data.frame(t(cibersort_filtered))
+inf_ciber_il$ID <- rownames(inf_ciber_il)  
+inf_ciber_il <- merge(inf_ciber_il, Inv_linfatica, by = "ID")
+inf_ciber_il$`Invasión Linfática` <- as.factor(inf_ciber_il$`Invasión Linfática`)
+inf_ciber_il <- inf_ciber_il[ , -8]   # Descartar tipos celulares cuyos valores son idénticos
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_il)[2:22]  
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_ciber_il[inf_ciber_il$`Invasión Linfática` == "Si", tipo]
+  grupo_No <- inf_ciber_il[inf_ciber_il$`Invasión Linfática` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_ciber2$significacion <- cut(
+  result_ciber2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_il, id.vars = c("ID", "Invasión Linfática"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber2$significacion[match(unique(infiltration_long$Cell_Type), result_ciber2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `Invasión Linfática`)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 0.7) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# MCP-counter
+## Preparar los datos
+MCP_filtered <- MCP_r2[, colnames(MCP_r2) %in% Inv_linfatica$ID]
+inf_MCP_il <- as.data.frame(t(MCP_filtered))
+inf_MCP_il$ID <- rownames(inf_MCP_il)  
+inf_MCP_il <- merge(inf_MCP_il, Inv_linfatica, by = "ID")
+inf_MCP_il$`Invasión Linfática` <- as.factor(inf_MCP_il$`Invasión Linfática`)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_il)[2:11]  
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_MCP_il[inf_MCP_il$`Invasión Linfática` == "Si", tipo]
+  grupo_No <- inf_MCP_il[inf_MCP_il$`Invasión Linfática` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_MCP2$significacion <- cut(
+  result_MCP2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_il, id.vars = c("ID", "Invasión Linfática"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP2$significacion[match(unique(infiltration_long$Cell_Type), result_MCP2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `Invasión Linfática`)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# quanTIseq
+## Preparar los datos
+quantiseq_filtered <- quantiseq_r2[, colnames(quantiseq_r2) %in% Inv_linfatica$ID]
+inf_quant_il <- as.data.frame(t(quantiseq_filtered))
+inf_quant_il$ID <- rownames(inf_quant_il)  
+inf_quant_il <- merge(inf_quant_il, Inv_linfatica, by = "ID")
+inf_quant_il$`Invasión Linfática` <- as.factor(inf_quant_il$`Invasión Linfática`)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_il)[2:12]  
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_quant_il[inf_quant_il$`Invasión Linfática` == "Si", tipo]
+  grupo_No <- inf_quant_il[inf_quant_il$`Invasión Linfática` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_quant2$significacion <- cut(
+  result_quant2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_il, id.vars = c("ID", "Invasión Linfática"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant2$significacion[match(unique(infiltration_long$Cell_Type), result_quant2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `Invasión Linfática`)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# ConsensusTME
+## Preparar los datos
+TME_filtered <- TME_r2_rep[, colnames(TME_r2_rep) %in% Inv_linfatica$ID]
+inf_TME_il <- as.data.frame(t(TME_filtered))
+inf_TME_il$ID <- rownames(inf_TME_il)  
+inf_TME_il <- merge(inf_TME_il, Inv_linfatica, by = "ID")
+inf_TME_il$`Invasión Linfática` <- as.factor(inf_TME_il$`Invasión Linfática`)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_il)[2:19]  
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_TME_il[inf_TME_il$`Invasión Linfática` == "Si", tipo]
+  grupo_No <- inf_TME_il[inf_TME_il$`Invasión Linfática` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_TME2$significacion <- cut(
+  result_TME2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_il, id.vars = c("ID", "Invasión Linfática"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME2$significacion[match(unique(infiltration_long$Cell_Type), result_TME2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `Invasión Linfática`)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+```
+
+## Quimioterapia adyuvante
+
+```{r}
+# Preparar el dataframe QTady
+QTady <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "QT adyuvante")]
+colnames(QTady) <- c("ID", "QT adyuvante")  
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber_qt <- as.data.frame(t(cibersort_r2_rep))
+inf_ciber_qt[] <- lapply(inf_ciber_qt, function(x) as.numeric(as.character(x)))   
+inf_ciber_qt$ID <- rownames(inf_ciber_qt)  
+inf_ciber_qt <- merge(inf_ciber_qt, QTady, by = "ID")
+inf_ciber_qt$`QT adyuvante` <- as.factor(inf_ciber_qt$`QT adyuvante`)
+inf_ciber_qt <- inf_ciber_qt[ , -8]   # Descartar tipos celulares cuyos valores son idénticos
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber_qt)[2:22]  
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_ciber_qt[inf_ciber_qt$`QT adyuvante` == "Si", tipo]
+  grupo_No <- inf_ciber_qt[inf_ciber_qt$`QT adyuvante` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_ciber2$significacion <- cut(
+  result_ciber2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_qt, id.vars = c("ID", "QT adyuvante"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber2$significacion[match(unique(infiltration_long$Cell_Type), result_ciber2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `QT adyuvante`)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 0.7) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# MCP-counter
+## Preparar los datos
+inf_MCP_qt <- as.data.frame(t(MCP_r2))
+inf_MCP_qt[] <- lapply(inf_MCP_qt, function(x) as.numeric(as.character(x))) 
+inf_MCP_qt$ID <- rownames(inf_MCP_qt)  
+inf_MCP_qt <- merge(inf_MCP_qt, QTady, by = "ID")
+inf_MCP_qt$`QT adyuvante` <- as.factor(inf_MCP_qt$`QT adyuvante`)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP_qt)[2:11]  
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_MCP_qt[inf_MCP_qt$`QT adyuvante` == "Si", tipo]
+  grupo_No <- inf_MCP_qt[inf_MCP_qt$`QT adyuvante` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_MCP2$significacion <- cut(
+  result_MCP2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_qt, id.vars = c("ID", "QT adyuvante"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP2$significacion[match(unique(infiltration_long$Cell_Type), result_MCP2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `QT adyuvante`)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# quanTIseq
+## Preparar los datos
+inf_quant_qt <- as.data.frame(t(quantiseq_r2))
+inf_quant_qt[] <- lapply(inf_quant_qt, function(x) as.numeric(as.character(x))) 
+inf_quant_qt$ID <- rownames(inf_quant_qt)  
+inf_quant_qt <- merge(inf_quant_qt, QTady, by = "ID")
+inf_quant_qt$`QT adyuvante` <- as.factor(inf_quant_qt$`QT adyuvante`)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant_qt)[2:12]  
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_quant_qt[inf_quant_qt$`QT adyuvante` == "Si", tipo]
+  grupo_No <- inf_quant_qt[inf_quant_qt$`QT adyuvante` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_quant2$significacion <- cut(
+  result_quant2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_qt, id.vars = c("ID", "QT adyuvante"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant2$significacion[match(unique(infiltration_long$Cell_Type), result_quant2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `QT adyuvante`)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  ) 
+
+# ConsensusTME
+## Preparar los datos
+inf_TME_qt <- as.data.frame(t(TME_r2_rep))
+inf_TME_qt[] <- lapply(inf_TME_qt, function(x) as.numeric(as.character(x)))   
+inf_TME_qt$ID <- rownames(inf_TME_qt)  
+inf_TME_qt <- merge(inf_TME_qt, QTady, by = "ID")
+inf_TME_qt$`QT adyuvante` <- as.factor(inf_TME_qt$`QT adyuvante`)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME_qt)[2:19]  
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_Si <- inf_TME_qt[inf_TME_qt$`QT adyuvante` == "Si", tipo]
+  grupo_No <- inf_TME_qt[inf_TME_qt$`QT adyuvante` == "No", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_Si)$p.value > 0.05 && shapiro.test(grupo_No)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_Si, grupo_No), grupo = rep(c("Si", "No"), times = c(length(grupo_Si), length(grupo_No))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_Si, grupo_No, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_Si, grupo_No)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+result_TME2$significacion <- cut(
+  result_TME2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_qt, id.vars = c("ID", "QT adyuvante"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME2$significacion[match(unique(infiltration_long$Cell_Type), result_TME2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = `QT adyuvante`)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+```
+
+## Inestabilidad de microsatélites
+
+Dado que los dos conjuntos de datos contienen información sobre la inestabilidad de microsatélites, en este caso, se han utilizado ambos para realizar la comparativa.
+
+### Dataset1
+
+```{r}
+# Preparar el dataframe MSI
+MSI <- clinic1[, c("ID", "msi_imputed")]
+colnames(MSI) <- c("ID", "MSI")  
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber1_msi <- as.data.frame(t(cibersort_r1_rep))
+inf_ciber1_msi[] <- lapply(inf_ciber1_msi, function(x) as.numeric(as.character(x)))   
+inf_ciber1_msi$ID <- rownames(inf_ciber1_msi)  
+inf_ciber1_msi <- merge(inf_ciber1_msi, MSI, by = "ID")
+inf_ciber1_msi$MSI <- as.factor(inf_ciber1_msi$MSI)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber1_msi)[2:23]  
+
+result_ciber1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_ciber1_msi[inf_ciber1_msi$MSI == "MSI", tipo]
+  grupo_MSS <- inf_ciber1_msi[inf_ciber1_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber1[result_ciber1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_ciber1$significacion <- cut(
+  result_ciber1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber1_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber1$significacion[match(unique(infiltration_long$Cell_Type), result_ciber1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 0.6) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# MCP-counter
+## Preparar los datos
+inf_MCP1_msi <- as.data.frame(t(MCP_r1))
+inf_MCP1_msi[] <- lapply(inf_MCP1_msi, function(x) as.numeric(as.character(x)))   
+inf_MCP1_msi$ID <- rownames(inf_MCP1_msi)  
+inf_MCP1_msi <- merge(inf_MCP1_msi, MSI, by = "ID")
+inf_MCP1_msi$MSI <- as.factor(inf_MCP1_msi$MSI)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP1_msi)[2:11]  
+
+result_MCP1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_MCP1_msi[inf_MCP1_msi$MSI == "MSI", tipo]
+  grupo_MSS <- inf_MCP1_msi[inf_MCP1_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP1[result_MCP1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_MCP1$significacion <- cut(
+  result_MCP1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP1_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP1$significacion[match(unique(infiltration_long$Cell_Type), result_MCP1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  ylim(NA, 13) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# quanTIseq
+## Preparar los datos
+inf_quant1_msi <- as.data.frame(t(quantiseq_r1))
+inf_quant1_msi[] <- lapply(inf_quant1_msi, function(x) as.numeric(as.character(x)))   
+inf_quant1_msi$ID <- rownames(inf_quant1_msi)  
+inf_quant1_msi <- merge(inf_quant1_msi, MSI, by = "ID")
+inf_quant1_msi$MSI <- as.factor(inf_quant1_msi$MSI)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant1_msi)[2:12]  
+
+result_quant1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_quant1_msi[inf_quant1_msi$MSI == "MSI", tipo]
+  grupo_MSS <- inf_quant1_msi[inf_quant1_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant1[result_quant1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_quant1$significacion <- cut(
+  result_quant1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant1_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant1$significacion[match(unique(infiltration_long$Cell_Type), result_quant1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# ConsensusTME
+## Preparar los datos
+inf_TME1_msi <- as.data.frame(t(TME_r1_rep))
+inf_TME1_msi[] <- lapply(inf_TME1_msi, function(x) as.numeric(as.character(x)))   
+inf_TME1_msi$ID <- rownames(inf_TME1_msi)  
+inf_TME1_msi <- merge(inf_TME1_msi, MSI, by = "ID")
+inf_TME1_msi$MSI <- as.factor(inf_TME1_msi$MSI)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_TME1_msi)[2:19]  
+
+result_TME1 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_TME1_msi[inf_TME1_msi$MSI == "MSI", tipo]
+  grupo_MSS <- inf_TME1_msi[inf_TME1_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME1[result_TME1$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_TME1$significacion <- cut(
+  result_TME1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME1_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME1), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME1$significacion[match(unique(infiltration_long$Cell_Type), result_TME1$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+```
+
+### Dataset2
+
+```{r}
+# Preparar el dataframe MSI
+MSI <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "MSI")]
+colnames(MSI) <- c("ID", "MSI") 
+MSI <- MSI[MSI$MSI %in% c("MSI-H","MSS"), ]   # Descartar los valores `MSI-UK`
+
+# CIBERSORT
+## Preparar los datos
+ciber_filtered <- cibersort_r2_rep[, colnames(cibersort_r2_rep) %in% MSI$ID]
+inf_ciber2_msi <- as.data.frame(t(ciber_filtered))
+inf_ciber2_msi$ID <- rownames(inf_ciber2_msi)  
+inf_ciber2_msi <- merge(inf_ciber2_msi, MSI, by = "ID")
+inf_ciber2_msi$MSI <- as.factor(inf_ciber2_msi$MSI)
+inf_ciber2_msi <- inf_ciber2_msi[ , -c(8,12)]
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_ciber2_msi)[2:21]  
+
+result_ciber2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_ciber2_msi[inf_ciber2_msi$MSI == "MSI-H", tipo]
+  grupo_MSS <- inf_ciber2_msi[inf_ciber2_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_ciber2[result_ciber2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_ciber2$significacion <- cut(
+  result_ciber2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber2_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_ciber2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_ciber2$significacion[match(unique(infiltration_long$Cell_Type), result_ciber2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  #ylim(NA, 0.6) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# MCP-counter
+## Preparar los datos
+MCP_filtered <- MCP_r2[, colnames(MCP_r2) %in% MSI$ID]
+inf_MCP2_msi <- as.data.frame(t(MCP_filtered))
+inf_MCP2_msi$ID <- rownames(inf_MCP2_msi)  
+inf_MCP2_msi <- merge(inf_MCP2_msi, MSI, by = "ID")
+inf_MCP2_msi$MSI <- as.factor(inf_MCP2_msi$MSI)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_MCP2_msi)[2:11]  
+
+result_MCP2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_MCP2_msi[inf_MCP2_msi$MSI == "MSI-H", tipo]
+  grupo_MSS <- inf_MCP2_msi[inf_MCP2_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_MCP2[result_MCP2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_MCP2$significacion <- cut(
+  result_MCP2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP2_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_MCP2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_MCP2$significacion[match(unique(infiltration_long$Cell_Type), result_MCP2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# quanTIseq
+## Preparar los datos
+quant_filtered <- quantiseq_r2[, colnames(quantiseq_r2) %in% MSI$ID]
+inf_quant2_msi <- as.data.frame(t(quant_filtered))
+inf_quant2_msi$ID <- rownames(inf_quant2_msi)  
+inf_quant2_msi <- merge(inf_quant2_msi, MSI, by = "ID")
+inf_quant2_msi$MSI <- as.factor(inf_quant2_msi$MSI)
+
+## Calcular si hay diferencias significativas
+tipos_celulares <- names(inf_quant2_msi)[2:12]  
+
+result_quant2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_quant2_msi[inf_quant2_msi$MSI == "MSI-H", tipo]
+  grupo_MSS <- inf_quant2_msi[inf_quant2_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_quant2[result_quant2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_quant2$significacion <- cut(
+  result_quant1$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant2_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_quant2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_quant2$significacion[match(unique(infiltration_long$Cell_Type), result_quant2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+
+# ConsensusTME
+## Preparar los datos
+TME_filtered <- TME_r2_rep[, colnames(TME_r2_rep) %in% MSI$ID]
+inf_TME2_msi <- as.data.frame(t(TME_filtered))
+inf_TME2_msi$ID <- rownames(inf_TME2_msi)  
+inf_TME2_msi <- merge(inf_TME2_msi, MSI, by = "ID")
+inf_TME2_msi$MSI <- as.factor(inf_TME2_msi$MSI)
+
+## Calcular si hay diferencias significativas.
+tipos_celulares <- names(inf_TME2_msi)[2:19]  
+
+result_TME2 <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  grupo_MSI <- inf_TME2_msi[inf_TME2_msi$MSI == "MSI-H", tipo]
+  grupo_MSS <- inf_TME2_msi[inf_TME2_msi$MSI == "MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_MSI)$p.value > 0.05 && shapiro.test(grupo_MSS)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor = c(grupo_MSI, grupo_MSS), grupo = rep(c("MSI", "MSS"), times = c(length(grupo_MSI), length(grupo_MSS))))
+    hom_var <- leveneTest(valor~grupo, data = datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if (hom_var) {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = TRUE)
+    } else {
+      test_result <- t.test(grupo_MSI, grupo_MSS, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_MSI, grupo_MSS)
+  }
+  # Guardar el p-valor en el dataframe
+  result_TME2[result_TME2$TipoCelular == tipo, "p_value"] <- test_result$p.value
+  }
+
+## Clasificar los p-valores en categorías de significación
+result_TME2$significacion <- cut(
+  result_TME2$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME2_msi, id.vars = c("ID", "MSI"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear una lista de comparaciones entre grupos para el boxplot
+comparisons <- lapply(1:nrow(result_TME2), function(i) {
+  c(i, i)
+})
+
+### Anotaciones con los valores de significación para cada tipo celular
+annotations <- result_TME2$significacion[match(unique(infiltration_long$Cell_Type), result_TME2$TipoCelular)]
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = MSI)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  geom_signif(
+    comparisons = comparisons,
+    annotations = annotations,
+    tip_length = 0, 
+  )
+```
+
+### Comparación resultados
+
+Una vez obtenidos los resultados para ambos conjuntos de datos, se comparan en una tabla.
+
+```{r}
+# Crear datasets
+dataset1 <- data.frame(
+  Tipo_Celular = c("Células B", "Células citotóxicas", "Células dendríticas", "Eosinófilos", "Macrófagos", "Mastocitos", "Células NK", "Neutrófilos", "Células T CD4", "Células T CD8", "Células T gamma delta", "Células T reguladoras", "Células T helper foliculares ", "Macrófagos M1", "Macrófagos M2", "Endoteliales", "Fibroblastos", "Monocitos", "Células plasmáticas"),
+  CIBERSORT = c("NS", "NA", "S", "NS", "S", "S", "S", "NS", "NS", "NS", "NS", "S", "NS", "S", "NS", "NA", "NA", "NS", "S"),
+  MCP.counter = c("S", "S", "S", "NA", "NA", "NA", "S", "S", "S", "S", "NA", "NA", "NA", "NA", "NA", "NS", "NS", "S", "NA"),
+  quanTIseq = c("S", "NA", "NS", "NA", "NA", "NA", "S", "NS", "S", "S", "NA", "S", "NA", "S", "NS", "NA", "NA", "S", "NA"),
+  ConsensusTME = c("S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "S", "NA", "S", "S", "NS", "S", "S", "S")
+  )
+dataset1[] <- lapply(dataset1, factor)
+
+dataset2 <- data.frame(
+  Tipo_Celular = c("Células B", "Células citotóxicas", "Células dendríticas", "Eosinófilos", "Macrófagos", "Mastocitos", "Células NK", "Neutrófilos", "Células T CD4", "Células T CD8", "Células T gamma delta", "Células T reguladoras", "Células T helper foliculares ", "Macrófagos M1", "Macrófagos M2", "Endoteliales", "Fibroblastos", "Monocitos", "Células plasmáticas"),
+  CIBERSORT = c("NS", "NA", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NA", "NA", "NS", "NS"),
+  MCP.counter = c("NS", "NS", "NS", "NA", "NA", "NA", "NS", "NS", "NS", "NS", "NA", "NA", "NA", "NA", "NA", "NS", "NS", "NS", "NA"),
+  quanTIseq = c("S", "NA", "NS", "NA", "NA", "NA", "S", "NS", "S", "S", "NA", "S", "NA", "S", "NS", "NA", "NA", "S", "NA"),
+  ConsensusTME = c("S", "NS", "S", "NS", "S", "S", "NS", "NS", "NS", "S", "S", "NS", "NA", "S", "NS", "NS", "NS", "NS", "NS")
+)
+
+dataset2[] <- lapply(dataset2, factor)
+
+# Añadir columna "Dataset"
+dataset1$Dataset <- "Dataset 1"
+dataset2$Dataset <- "Dataset 2"
+
+# Combinar en un solo dataframe
+resultados <- rbind(dataset1, dataset2)
+
+# Convertir a formato largo
+resultados_largos <- melt(resultados, id.vars = c("Tipo_Celular", "Dataset"), 
+                          variable.name = "Metodo", value.name = "Resultado")
+
+# Crear anotaciones para los tipos celulares de CIBERSORT
+anotaciones <- data.frame(
+  Dataset = c("Dataset 1"), 
+  Tipo_Celular = c("Células dendríticas"), 
+  Metodo = c("CIBERSORT"), 
+  label = c("Activadas"), 
+  Resultado = c("S")
+)
+
+# Representar tabla
+ggplot(resultados_largos, aes(x = Metodo, y = Tipo_Celular, fill = Resultado)) +
+  geom_tile(color = "white", linewidth=0.5) +
+  scale_fill_manual(values = c("S" = "#ff7f0e", 
+                               "NS" = "#1f77b4", 
+                               "NA" = "#d3d3d3")) +
+ facet_wrap(~ Dataset, ncol = 2) + 
+  theme_minimal() +
+  labs(title = "Coincidencias entre métodos de deconvolución",
+       x = "Métodos",
+       y = "Tipos Celulares") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),  
+        axis.text.y = element_text(size = 7),
+        panel.grid = element_blank(),  
+        strip.text = element_text(size = 12, face = "bold"),  
+        legend.key.size = unit(0.5, "cm"),  
+        legend.text = element_text(size = 8),  
+        legend.title = element_text(size = 10)) + 
+  scale_x_discrete(expand = c(0, 0)) +  
+  scale_y_discrete(expand = c(0, 0))  +  
+   geom_text(data = anotaciones, aes(x = Metodo, y = Tipo_Celular, label = label), 
+            color = "white", size = 2, fontface = "italic")
+
+```
+
+### Estratificación MSI-Estadio
+
+Dado el mayor tamaño del Dataset1, ha sido posible estratificar a los pacientes según su estadio tumoral y la presencia de inestabilidad de microsatélites con el fin de determinar si existen diferencias en la infiltración del sistema inmune entre los estadios II y III en función de la presencia o ausencia de inestabilidad de microsatélites.
+
+```{r}
+# Preparar el dataframe Grupo
+Grupo <- clinic1[, c("ID", "group")]
+colnames(Grupo) <- c("ID", "Grupo") 
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber_grupo <- as.data.frame(t(cibersort_r1_rep))
+inf_ciber_grupo[] <- lapply(inf_ciber_grupo, function(x) as.numeric(as.character(x)))   
+inf_ciber_grupo$ID <- rownames(inf_ciber_grupo)  
+inf_ciber_grupo <- merge(inf_ciber_grupo, Grupo, by = "ID")
+inf_ciber_grupo$Grupo <- as.factor(inf_ciber_grupo$Grupo)
+inf_ciber_grupo$Grupo <- factor(inf_ciber_grupo$Grupo, levels = c("Stage II, MSI", "Stage III, MSI", "Stage II, MSS", "Stage III, MSS"))
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSI
+tipos_celulares <- names(inf_ciber_grupo)[2:23]  
+
+res_ciber_MSI <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_ciber_grupo[inf_ciber_grupo$Grupo == "Stage II, MSI", tipo]
+  grupo_III <- inf_ciber_grupo[inf_ciber_grupo$Grupo == "Stage III, MSI", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_ciber_MSI[res_ciber_MSI$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_ciber_MSI$significacion <- cut(
+  res_ciber_MSI$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_ciber_MSI)
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSS
+res_ciber_MSS <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_ciber_grupo[inf_ciber_grupo$Grupo == "Stage II, MSS", tipo]
+  grupo_III <- inf_ciber_grupo[inf_ciber_grupo$Grupo == "Stage III, MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_ciber_MSS[res_ciber_MSS$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_ciber_MSS$significacion <- cut(
+  res_ciber_MSS$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_ciber_MSS)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_ciber_grupo, id.vars = c("ID", "Grupo"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grupo)) +
+  geom_boxplot() +
+  labs(title = "CIBERSORT",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.text = element_text(size = 6),  
+        legend.title = element_text(size = 7)) +  
+  ylim(NA, 0.55) +
+  # Añadir la significación manualmente
+  geom_signif(y_position = c(0.35, 0.25, 0.4, 0.45, 0.15), xmin = c(3, 5, 8, 12, 14.6), xmax = c(3.5,5.5,8.5,12.5,15), annotation = c("**","*", "*", "**", "*"),
+              tip_length = 0) 
+
+# MCP-counter
+## Preparar los datos
+inf_MCP_grupo <- as.data.frame(t(MCP_r1))
+inf_MCP_grupo[] <- lapply(inf_MCP_grupo, function(x) as.numeric(as.character(x)))   
+inf_MCP_grupo$ID <- rownames(inf_MCP_grupo)  
+inf_MCP_grupo <- merge(inf_MCP_grupo, Grupo, by = "ID")
+inf_MCP_grupo$Grupo <- as.factor(inf_MCP_grupo$Grupo)
+inf_MCP_grupo$Grupo <- factor(inf_MCP_grupo$Grupo, levels = c("Stage II, MSI", "Stage III, MSI", "Stage II, MSS", "Stage III, MSS"))
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSI
+tipos_celulares <- names(inf_MCP_grupo)[2:11]  
+
+res_MCP_MSI <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_MCP_grupo[inf_MCP_grupo$Grupo == "Stage II, MSI", tipo]
+  grupo_III <- inf_MCP_grupo[inf_MCP_grupo$Grupo == "Stage III, MSI", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_MCP_MSI[res_MCP_MSI$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_MCP_MSI$significacion <- cut(
+  res_MCP_MSI$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_MCP_MSI)
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSS
+res_MCP_MSS <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_MCP_grupo[inf_MCP_grupo$Grupo == "Stage II, MSS", tipo]
+  grupo_III <- inf_MCP_grupo[inf_MCP_grupo$Grupo == "Stage III, MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_MCP_MSS[res_MCP_MSS$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_MCP_MSS$significacion <- cut(
+  res_MCP_MSS$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_MCP_MSS)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_MCP_grupo, id.vars = c("ID", "Grupo"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grupo)) +
+  geom_boxplot() +
+  labs(title = "MCP-counter",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.text = element_text(size = 6),  
+        legend.title = element_text(size = 7)) +  
+  # Añadir la significación manualmente
+  geom_signif(y_position = 10.5, xmin = 3.6, xmax = 4, annotation = "*", tip_length = 0) 
+
+# quanTIseq
+## Preparar los datos
+inf_quant_grupo <- as.data.frame(t(quantiseq_r1))
+inf_quant_grupo[] <- lapply(inf_quant_grupo, function(x) as.numeric(as.character(x)))   
+inf_quant_grupo$ID <- rownames(inf_quant_grupo)  
+inf_quant_grupo <- merge(inf_quant_grupo, Grupo, by = "ID")
+inf_quant_grupo$Grupo <- as.factor(inf_quant_grupo$Grupo)
+inf_quant_grupo$Grupo <- factor(inf_quant_grupo$Grupo, levels = c("Stage II, MSI", "Stage III, MSI", "Stage II, MSS", "Stage III, MSS"))
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSI
+tipos_celulares <- names(inf_quant_grupo)[2:12]  
+
+res_quant_MSI <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_quant_grupo[inf_quant_grupo$Grupo == "Stage II, MSI", tipo]
+  grupo_III <- inf_quant_grupo[inf_quant_grupo$Grupo == "Stage III, MSI", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_quant_MSI[res_quant_MSI$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_quant_MSI$significacion <- cut(
+  res_quant_MSI$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_quant_MSI)
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSS
+res_quant_MSS <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_quant_grupo[inf_quant_grupo$Grupo == "Stage II, MSS", tipo]
+  grupo_III <- inf_quant_grupo[inf_quant_grupo$Grupo == "Stage III, MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_quant_MSS[res_quant_MSS$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_quant_MSS$significacion <- cut(
+  res_quant_MSS$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_quant_MSS)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_quant_grupo, id.vars = c("ID", "Grupo"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grupo)) +
+  geom_boxplot() +
+  labs(title = "quanTIseq",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.text = element_text(size = 6),  
+        legend.title = element_text(size = 7)) +  
+  geom_signif(y_position = c(0.45, 1), xmin = c(6.6, 1), xmax = c(7, 1.4), annotation = c("*", "*"), tip_length = 0) 
+
+# ConsensusTME
+## Preparar los datos
+inf_TME_grupo <- as.data.frame(t(TME_r1_rep))
+inf_TME_grupo[] <- lapply(inf_TME_grupo, function(x) as.numeric(as.character(x)))   
+inf_TME_grupo$ID <- rownames(inf_TME_grupo)  
+inf_TME_grupo <- merge(inf_TME_grupo, Grupo, by = "ID")
+inf_TME_grupo$Grupo <- as.factor(inf_TME_grupo$Grupo)
+inf_TME_grupo$Grupo <- factor(inf_TME_grupo$Grupo, levels = c("Stage II, MSI", "Stage III, MSI", "Stage II, MSS", "Stage III, MSS"))
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSI
+tipos_celulares <- names(inf_TME_grupo)[2:19]  
+
+res_TME_MSI <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_TME_grupo[inf_TME_grupo$Grupo == "Stage II, MSI", tipo]
+  grupo_III <- inf_TME_grupo[inf_TME_grupo$Grupo == "Stage III, MSI", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_TME_MSI[res_TME_MSI$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_TME_MSI$significacion <- cut(
+  res_TME_MSI$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_TME_MSI)
+
+## Calcular si hay diferencias significativas entre estadio II y III entre los pacientes con MSS
+res_TME_MSS <- data.frame(TipoCelular = tipos_celulares, p_value = NA)
+
+for (tipo in tipos_celulares) {
+  
+  grupo_II <- inf_TME_grupo[inf_TME_grupo$Grupo == "Stage II, MSS", tipo]
+  grupo_III <- inf_TME_grupo[inf_TME_grupo$Grupo == "Stage III, MSS", tipo]
+  
+  # Comprobar la normalidad de los datos utilizando la prueba de Shapiro-Wilk
+  if (shapiro.test(grupo_II)$p.value > 0.05 && shapiro.test(grupo_III)$p.value > 0.05) {
+    
+    # Comprobar homogeneidad de varianzas utilizando la prueba de Levene
+    datos_grupo <- data.frame(valor =c(grupo_II, grupo_III), grupo = rep(c("II", "III"), times=c(length(grupo_II), length(grupo_III))))
+    hom_var <- leveneTest(valor ~ grupo, data=datos_grupo)$`Pr(>F)`[1]>0.05
+    
+    # Seleccionar la prueba T según la homogeneidad de varianzas
+    if(hom_var){
+      test_result <- t.test(grupo_II, grupo_III, var.equal = TRUE)
+    } else {
+      test_result<- t.test(grupo_II, grupo_III, var.equal = FALSE)
+    }
+  } else {
+    # Aplicar prueba no paramétrica
+    test_result <- wilcox.test(grupo_II, grupo_III)
+  }
+  # Guardar el p-valor en el dataframe
+  res_TME_MSS[res_TME_MSS$TipoCelular == tipo, "p_value"] <- test_result$p.value
+}
+
+## Clasificar los p-valores en categorías de significación
+res_TME_MSS$significacion <- cut(
+  res_TME_MSS$p_value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, 1),
+  labels = c("***", "**", "*", ""),
+  right = FALSE
+)
+
+print(res_TME_MSS)
+
+## Representar el boxplot
+### Convertir los datos a formato largo
+infiltration_long <- melt(inf_TME_grupo, id.vars = c("ID", "Grupo"), 
+                          variable.name = "Cell_Type", value.name = "Infiltration")
+
+### Crear el boxplot
+ggplot(infiltration_long, aes(x = Cell_Type, y = Infiltration, fill = Grupo)) +
+  geom_boxplot() +
+  labs(title = "ConsensusTME",
+       x = "Tipos Celulares",
+       y = "Infiltración") +
+  scale_fill_brewer(palette = "Set1") +  
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.text = element_text(size = 6),  
+        legend.title = element_text(size = 7)) +  
+  geom_signif(y_position = c(0.85, 0.85, 0.85, 0.85, 0.85, 0.95, 0.85), xmin = c(3, 4, 5, 9, 10, 16, 18), xmax = c(3.4, 4.4, 5.4, 9.4, 10.4, 16.4, 18.4), annotation = c("*", "**", "*", "*", "*", "*", "**"), tip_length = 0) 
+```
+
+Una vez obtenidos los resultados, se han comparado en una tabla.
+
+```{r}
+# Crear datasets
+MSI <- data.frame(
+  Tipo_Celular = c("Células B", "Células citotóxicas", "Células dendríticas", "Eosinófilos", "Macrófagos", "Mastocitos", "Células NK", "Neutrófilos", "Células T CD4", "Células T CD8", "Células T gamma delta", "Células T reguladoras", "Células T helper foliculares ", "Macrófagos M1", "Macrófagos M2", "Endoteliales", "Fibroblastos", "Monocitos", "Células plasmáticas"),
+  CIBERSORT = c("NS", "NA", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "S", "NS", "NA", "NA", "NS", "NS"),
+  MCP.counter = c("S", "NS", "NS", "NA", "NA", "NA", "NS", "NS", "NS", "NS", "NA", "NA", "NA", "NA", "NA", "NS", "NS", "NS", "NA"),
+  quanTIseq = c("NS", "NA", "NS", "NA", "NA", "NA", "NS", "NS", "S", "NS", "NA", "NS", "NA", "NS", "NS", "NA", "NA", "NS", "NA"),
+  ConsensusTME = c("NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NA", "NS", "NS", "NS", "NS", "NS", "NS")
+  )
+MSI[] <- lapply(MSI, factor)
+
+MSS <- data.frame(
+  Tipo_Celular = c("Células B", "Células citotóxicas", "Células dendríticas", "Eosinófilos", "Macrófagos", "Mastocitos", "Células NK", "Neutrófilos", "Células T CD4", "Células T CD8", "Células T gamma delta", "Células T reguladoras", "Células T helper foliculares ", "Macrófagos M1", "Macrófagos M2", "Endoteliales", "Fibroblastos", "Monocitos", "Células plasmáticas"),
+  CIBERSORT = c("NS", "NA", "NS", "NS", "NS", "NS", "S", "NS", "S", "NS", "NS", "NS", "S", "NS", "NS", "NA", "NA", "NS", "S"),
+  MCP.counter = c("NS", "NS", "NS", "NA", "NA", "NA", "NS", "NS", "NS", "NS", "NA", "NA", "NA", "NA", "NA", "NS", "NS", "NS", "NA"),
+  quanTIseq = c("S", "NA", "NS", "NA", "NA", "NA", "NS", "NS", "NS", "NS", "NA", "NS", "NA", "NS", "NS", "NA", "NA", "NS", "NA"),
+  ConsensusTME = c("NS", "NS", "S", "S", "S", "NS", "NS", "NS", "S", "S", "NS", "NS", "NA", "NS", "NS", "NS", "S", "NS", "S")
+)
+
+MSS[] <- lapply(MSS, factor)
+
+# Añadir columna "Dataset"
+MSI$Dataset <- "MSI"
+MSS$Dataset <- "MSS"
+
+# Combinar en un solo dataframe
+resultados <- rbind(MSI, MSS)
+
+# Convertir a formato largo
+resultados_largos <- melt(resultados, id.vars = c("Tipo_Celular", "Dataset"), 
+                          variable.name = "Metodo", value.name = "Resultado")
+
+# Crear anotaciones para los tipos celulares de CIBERSORT
+anotaciones <- data.frame(
+  Dataset = c("MSS", "MSS"), 
+  Tipo_Celular = c("Células T CD4", "Células NK"), 
+  Metodo = c("CIBERSORT", "CIBERSORT"), 
+  label = c("Naive", "Activadas"), 
+  Resultado = c("S", "S")
+)
+
+# Representar
+ggplot(resultados_largos, aes(x = Metodo, y = Tipo_Celular, fill = Resultado)) +
+  geom_tile(color = "white", linewidth=0.5) +
+  scale_fill_manual(values = c("S" = "#ff7f0e", 
+                               "NS" = "#1f77b4", 
+                               "NA" = "#d3d3d3")) +
+ facet_wrap(~ Dataset, ncol = 2) + 
+  theme_minimal() +
+  labs(title = "Coincidencias entre métodos de deconvolución",
+       x = "Métodos",
+       y = "Tipos Celulares") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),  
+        axis.text.y = element_text(size = 7),
+        panel.grid = element_blank(),  
+        strip.text = element_text(size = 12, face = "bold"),  
+        legend.key.size = unit(0.5, "cm"),  
+        legend.text = element_text(size = 8),  
+        legend.title = element_text(size = 10)) + 
+  scale_x_discrete(expand = c(0, 0)) +  
+  scale_y_discrete(expand = c(0, 0))  +  
+   geom_text(data = anotaciones, aes(x = Metodo, y = Tipo_Celular, label = label), 
+            color = "white", size = 2, fontface = "italic")
+```
+
+# Análisis de supervivencia
+
+```{r}
+# Crear un dataframe para los análisis de supervivencia
+Surv <- clinic2[, c("CÓDIGO IDENTIFICACIÓN", "SurvTime", "Status")]
+colnames(Surv) <- c("ID", "SurvTime", "Status")
+
+# CIBERSORT
+## Preparar los datos
+inf_ciber_surv <- as.data.frame(t(cibersort_r2_rep))
+inf_ciber_surv[] <- lapply(inf_ciber_surv, function(x) as.numeric(as.character(x)))   
+inf_ciber_surv$ID <- rownames(inf_ciber_surv)  
+inf_ciber_surv <- merge(inf_ciber_surv, Surv, by = "ID")
+inf_ciber_surv <- inf_ciber_surv[ , -c(8, 10, 12)]   # Descartar tipos celulares cuyos valores son idénticos
+colnames(inf_ciber_surv) <- gsub(" ", ".", colnames(inf_ciber_surv))    # Renombrar columnas para eliminar espacios
+inf_ciber_surv <- inf_ciber_surv[!is.na(inf_ciber_surv$SurvTime), ]   # Descartar filas con valores NA en el tiempo de supervivencia.
+inf_ciber_surv$Status <- as.numeric(as.character(inf_ciber_surv$Status))    # Transformar la variable Status en numérica
+
+## Usar `surv_cutpoint` para encontrar el mejor punto de corte para los datos de infiltración
+cutpoint <- surv_cutpoint(inf_ciber_surv, time = "SurvTime", event = "Status",
+   variables = names(inf_ciber_surv[2:20]))
+
+## Utilizar `surv_categorize` para estratificar los valores de infiltración en función del punto de corte 
+ciber_cat <- surv_categorize(cutpoint)
+ciber_cat[, 3:21] <- lapply(ciber_cat[, 3:21], as.factor)   # Transformar las variables de infiltración en factores
+
+## Análisis de supervivencia
+Y=Surv(ciber_cat$SurvTime,ciber_cat$Status==1)   # Crear un objeto de supervivencia
+
+cell_types <- colnames(ciber_cat)[3:21] 
+
+plots <- list()
+
+### Representar las gráficas de supervivencia de cada tipo celular
+for (cell_type in cell_types) {
+  # Ajustar el modelo de Kaplan-Meier
+  kmfit <- survfit(Y ~ ciber_cat[[cell_type]])
+  
+  # Generar la gráfica
+  plot <- ggsurvplot(
+   kmfit,                     
+   data = ciber_cat,             
+   conf.int = TRUE,
+   pval = TRUE,             
+   xlab = "Tiempo de supervivencia (días)",
+   ylab = "Probabilidad de supervivencia",
+   ggtheme = theme_light(), 
+   title = cell_type,
+   risk.table.y.text.col = T, 
+   risk.table.y.text = FALSE,
+   legend.labs = c("High", "Low"),
+   legend.position = c(0.5, 0.5)
+                            
+)
+  # Formatear la leyenda del gráfico
+  plot$plot <- plot$plot + theme(
+    legend.background = element_rect(fill = "transparent"),  
+    legend.key = element_blank(),  
+    legend.title = element_text(size = 10),  
+    legend.text = element_text(size = 8),   
+    plot.title = element_text(size = 12),   
+    legend.position = c(0.85, 0.25),  
+    panel.grid = element_blank(),  
+  )
+  
+  plots[[cell_type]] <- plot$plot
+  
+}
+
+print(plots)
+
+# ConsensusTME
+## Preparar los datos 
+inf_TME_surv <- as.data.frame(t(TME_r2_rep))
+inf_TME_surv[] <- lapply(inf_TME_surv, function(x) as.numeric(as.character(x))) 
+inf_TME_surv$ID <- rownames(inf_TME_surv)  
+inf_TME_surv <- merge(inf_TME_surv, Surv, by = "ID")
+inf_TME_surv <- inf_TME_surv[!is.na(inf_TME_surv$SurvTime), ]   # Descartar filas con valores NA en el tiempo de supervivencia
+inf_TME_surv$Status <- as.numeric(as.character(inf_TME_surv$Status))    # Transformar la variable Status en numérica
+
+## Usar `surv_cutpoint` para encontrar el mejor punto de corte para los datos de infiltración
+cutpoint <- surv_cutpoint(inf_TME_surv, time = "SurvTime", event = "Status",
+   variables = names(inf_TME_surv[2:19]))
+
+## Utilizar `surv_categorize` para estratificar los valores de infiltración en función del punto de corte    
+TME_cat <- surv_categorize(cutpoint)
+TME_cat[, 3:20] <- lapply(TME_cat[, 3:20], as.factor)   # Transformar las variables de infiltración en factores
+
+## Análisis de supervivencia
+Y=Surv(TME_cat$SurvTime,TME_cat$Status==1)   # Crear un objeto de supervivencia
+
+cell_types <- colnames(TME_cat)[3:20] 
+
+plots <- list()
+
+### Representar las gráficas de supervivencia de cada tipo celular
+for (cell_type in cell_types) {
+  # Ajustar el modelo de Kaplan-Meier
+  kmfit <- survfit(Y ~ TME_cat[[cell_type]])
+  
+  # Generar la gráfica
+  plot <- ggsurvplot(
+   kmfit,                     
+   data = TME_cat,             
+   conf.int = TRUE,
+   pval = TRUE,             
+   xlab = "Tiempo de supervivencia (días)",
+   ylab = "Probabilidad de supervivencia",
+   ggtheme = theme_light(), 
+   title = cell_type,
+   risk.table.y.text.col = T, 
+   risk.table.y.text = FALSE,
+   legend.labs = c("High", "Low"),
+   legend.position = c(0.5, 0.5)
+                            
+)
+  # Formatear la leyenda del gráfico
+  plot$plot <- plot$plot + theme(
+    legend.background = element_rect(fill = "transparent"),  
+    legend.key = element_blank(),  
+    legend.title = element_text(size = 10),  
+    legend.text = element_text(size = 8),   
+    plot.title = element_text(size = 12),   
+    legend.position = c(0.85, 0.25),  
+    panel.grid = element_blank(),  
+  )
+  
+  plots[[cell_type]] <- plot$plot
+  
+}
+
+print(plots)
+```
